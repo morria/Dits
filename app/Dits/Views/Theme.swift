@@ -52,7 +52,8 @@ struct LevelMeter: View {
         }
         .frame(width: 46, height: 5)
         .animation(.linear(duration: 0.12), value: level)
-        .accessibilityHidden(true)
+        .accessibilityLabel("Audio input level")
+        .accessibilityValue("\(Int(min(1, level) * 100)) percent")
     }
 }
 

@@ -24,6 +24,10 @@
 	<false/>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Dits connects to a Morserino-32 keyer over Bluetooth so your messages can be keyed on the radio.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Dits uses your location once to fill in your Maidenhead grid square. Your location is never transmitted or stored elsewhere.</string>
 	<key>NSMicrophoneUsageDescription</key>
@@ -37,6 +41,8 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

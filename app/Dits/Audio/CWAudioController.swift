@@ -314,6 +314,26 @@ final class CWAudioController {
         player.stop()
     }
 
+    /// Play keyed audio through the BUILT-IN SPEAKER only — never the
+    /// connected audio interface, where it would key the radio via VOX.
+    /// If the route override fails, nothing plays: silence is safer than
+    /// an accidental transmission.
+    func preview(_ samples: [Float], gain: Float, completion: @escaping (Bool) -> Void) {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.overrideOutputAudioPort(.speaker)
+        } catch {
+            completion(false)
+            return
+        }
+        play(samples, gain: gain) { played in
+            DispatchQueue.main.async {
+                try? session.overrideOutputAudioPort(.none)
+                completion(played)
+            }
+        }
+    }
+
     /// Estimated playback duration of a rendered buffer, in seconds.
     static func duration(ofSampleCount count: Int) -> Double {
         Double(count) / sampleRate

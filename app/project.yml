@@ -47,10 +47,15 @@ targets:
         NSLocationWhenInUseUsageDescription: >-
           Dits uses your location once to fill in your Maidenhead grid
           square. Your location is never transmitted or stored elsewhere.
+        NSBluetoothAlwaysUsageDescription: >-
+          Dits connects to a Morserino-32 keyer over Bluetooth so your
+          messages can be keyed on the radio.
         ITSAppUsesNonExemptEncryption: false
         LSApplicationCategoryType: public.app-category.utilities
         UIBackgroundModes:
           - audio
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
     settings:

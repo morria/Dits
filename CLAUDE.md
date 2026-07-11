@@ -31,7 +31,7 @@ app/Dits/
   Utilities/                    CallsignParser, Maidenhead, CWMacros, Haptics, LocationFetcher
   Views/                        RootView, StatusBarView, ConversationListView, ConversationView,
                                 MessageBubble, ComposeBar, MonitorView, SettingsView,
-                                NewConversationSheet, OnboardingSheet, Theme
+                                OnboardingSheet, Theme
   Assets.xcassets/              AppIcon (tools/make_icon.py), AccentColor
 app/DitsTests/                  CW roundtrip, CallsignParser, Maidenhead, CWMacros
 tools/                          make_icon.py, install-device.sh, upload-testflight.sh
@@ -39,10 +39,25 @@ tools/                          make_icon.py, install-device.sh, upload-testflig
 
 ## Key design points
 
-- **CW has no addressing.** Conversations are keyed by callsign parsed from
-  the copy. Routing is deliberately conservative — `CallsignParser.counterparty`
+- **CW has no addressing.** Copy is routed to a thread by the callsign parsed
+  out of it. Routing is deliberately conservative — `CallsignParser.counterparty`
   requires "DE \<call\>" structure so band noise never spawns junk threads.
-  The Band Monitor shows the raw, unfiltered feed regardless.
+  The Band Monitor shows the raw, unfiltered feed regardless. For the same
+  reason there is no "new conversation" sheet: you can't address a station
+  you haven't heard, so the compose button starts a fresh CQ thread
+  (opening call prefilled, never auto-sent). You work a specific station by
+  answering it — from the Band Monitor, or its existing thread.
+- **Conversations have identity, not callsign keys.** `Conversation.id` is a
+  UUID (legacy stores are migrated on load and written back once, so ids stop
+  moving). Several CQ threads coexist — one per call you make — and copy joins
+  the *newest* thread with a given station. Exactly one thread is `active`:
+  it receives unaddressed copy inside `qsoReplyWindow` (5 min). Keying,
+  starting a new call, or a parsed callsign moves `active`, so an old thread
+  never quietly keeps collecting. `startNewConversation()` always lands in an
+  empty thread (reusing an untouched CQ rather than duplicating it) and
+  retires the previous CQ's answer window. `RadioController.commitCopy` is
+  internal, not private, so `ConversationRoutingTests` can drive routing
+  without an audio path.
 - **Half-duplex.** RX is muted (and the decoder reset) while transmitting so
   the app never decodes its own sidetone. TX render happens off-main
   (`encodeAsync`); completion uses `.dataPlayedBack` + an engine-alive check
@@ -71,16 +86,74 @@ tools/                          make_icon.py, install-device.sh, upload-testflig
 
 The decoders are in `AmateurDigitalCore`; measure with
 `swift run -c release CWBenchmark` (`--dual` = the app's shipped decoder,
-`--bayesian-only`, default = classic). Composite as of 2026-07:
-**97.03** for classic and dual (baselines were 91.33 / 89.26). Key fixes
-made from this project (in the library working tree):
-- AFC no longer retunes away from a healthy signal (noise/QRM capture bug
-  that corrupted characters at every SNR), and initial-scan ordering is
-  fixed so acquisition still works at ±200 Hz.
-- `thresholdFractionClean` 0.20 → 0.08 (AGC-pumping resilience, 62 → 100).
-- `DualCWDecoder` merge rewritten: sample-based clock, order-preserving,
-  agreement-fraction reliability (not output rate), `flush()`, min/max WPM.
-- Benchmark: added `--dual`, made ITU seeds deterministic.
+`--bayesian-only`, default = classic; `--fp-only` = fast subset for
+false-positive tuning). Composite as of 2026-07-10: **classic 96.8,
+bayesian 96.7, dual 96.7** — the suite gained three acoustic
+false-positive scenarios (impulsive_room, level_wander, tone_flutter:
+what an idle iPhone mic actually hears; all three decoders now score
+100 on the false_positive category), so these are NOT comparable to
+the 2026-07-03 suite-v2 numbers (97.2/97.2/97.1), which are themselves
+not comparable to v1 (97.03). Known cost: jitter/40pct (extreme-fist
+edge case) no longer copies — its dit/dah clusters are statistically
+indistinguishable from noise under the emission probation. Fast tuning loop: JSON param
+overrides via `--params` (classic) / `--bayesian-params` (bayesian),
+no rebuild needed. Real-audio corpus: `CWBenchmark --corpus <dir>`
+scores WAVs against sidecar `.txt` transcripts (kept out of the
+composite as an overfitting check); `DecodeWAV --mode cw` decodes a
+single recording. Key architecture (2026-07-03 pass, both decoders
+unless noted):
+- Hysteresis tone gate (ON at the adaptive threshold, OFF at 0.4× with a
+  3×-noise floor) — AGC-pumping immunity without element stretching.
+- Min-statistics noise floor (cap at 6× the rolling min of smoothed
+  power) — recovers from tone-contaminated startup within ~1 s.
+- Two-consecutive-block bootstrap + idle un-bootstrap + SNR-gated
+  emission — an idle band stays silent for hours instead of E/T chatter.
+- Adaptive gap clustering (nearest-log-cluster learning, order-statistic
+  word threshold) — Farnsworth and compressed fists both copy.
+- Phase-slope fine AFC (Goertzel complex output) — follows continuous
+  drift up to ~5 Hz/s without rebuilding the FIR; coarse AFC keeps the
+  never-abandon-healthy-signal veto.
+- Noise blanker ahead of the FIR — QRN static crashes no longer ring
+  through the narrow filter.
+- Bayesian: beam search prunes against the Morse tree with a ham-text
+  character prior; prosigns (SK/CT/SOS/SN) decode as `<SK>` etc.
+- `resynchronize()` preserves calibration across the app's TX mute
+  (reset() would re-learn the noise floor while the reply is starting).
+- Sub-block edge timing: quarter-block Goertzel refinement at gate
+  transitions (fractional element/gap durations; neutral 0.5 fractions
+  reproduce legacy whole-block behavior when SNR is poor) — 30–40 WPM
+  hand-sent jitter now copies clean.
+- Emission probation (2026-07-10, both decoders): post-bootstrap
+  characters are held until element/gap timing proves CW-like rhythm
+  (tight dit/dah clusters ~3× apart, per-class CV ≤ 0.28, gaps on the
+  1/3/7-dit grid), sustained across two evaluations 4+ elements apart;
+  at the 2-block quantization floor (40+ WPM) timing is unfalsifiable
+  so a 12× SNR corroboration is required; a rhythm-EMA watchdog revokes
+  a confirmed channel that degenerates (speed changes revoke too, but
+  held chars re-flush on re-confirmation — latency, not loss); held
+  copy gets a relaxed last-chance check at un-bootstrap / flush so a
+  lone "CQ" isn't swallowed. This is what keeps an idle *acoustic*
+  channel (room impulses, level wander, tonal flutter) silent — the
+  old SNR gates only handled stationary noise.
+
+## App receive/TX extras
+
+- Spectrum strip (300–1100 Hz, tap-to-tune) atop the Band Monitor;
+  `SpectrumAnalyzer` also feeds an optional 2-channel skimmer
+  (`settings.skimmerEnabled`) that decodes off-channel signals into the
+  monitor. Live meters poll the decoder at 2.5 Hz.
+- Morserino-32 BLE keyer (`Morserino/MorserinoKeyer.swift`, NUS +
+  m32 protocol): when connected, `RadioController.transmit` routes text
+  to `PUT cw/play/...` instead of the audio path; Settings → Keyer.
+- Template messages (`QuickMessage`, Settings → Messages) with {CALL}
+  {NAME} {QTH} {GRID} {THEIRCALL} placeholders fill the compose field;
+  an empty compose field turns Send into repeat-last-sent.
+- Active-QSO routing: keying to a counterparty (or a parsed "DE call")
+  opens a 5-minute window during which substantial unparsed copy routes
+  into that thread — mid-QSO overs drop the "DE" prefix. Junk-gated by
+  `isSubstantialCopy` (≥4 chars, <70% E/I/S/H/5/T). ConversationView
+  pins a live copy strip above the compose bar while decode is in
+  progress.
 
 ## Deploy
 

@@ -5,7 +5,7 @@ import SwiftUI
 
 struct ConversationListView: View {
     @EnvironmentObject private var radio: RadioController
-    var openConversation: (String) -> Void
+    var openConversation: (UUID) -> Void
     var openMonitor: () -> Void
 
     var body: some View {
@@ -26,14 +26,14 @@ struct ConversationListView: View {
             } else {
                 Section("Conversations") {
                     ForEach(radio.conversations) { conversation in
-                        Button { openConversation(conversation.counterparty) } label: {
+                        Button { openConversation(conversation.id) } label: {
                             ConversationRow(conversation: conversation)
                         }
                         .buttonStyle(.plain)
                     }
                     .onDelete { indexSet in
                         for index in indexSet {
-                            radio.deleteConversation(radio.conversations[index].counterparty)
+                            radio.deleteConversation(radio.conversations[index].id)
                         }
                     }
                 }
@@ -50,11 +50,19 @@ struct ConversationListView: View {
                 .padding(.top, 24)
             Text("No conversations yet")
                 .font(.headline)
-            Text("Start listening and stations you copy will show up here. Tap the pencil to call CQ.")
+            Text("Stations you copy will show up here — or make the first move.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
+            Button {
+                openConversation(radio.startNewConversation())
+            } label: {
+                Label("Call CQ", systemImage: "megaphone")
+            }
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.capsule)
+            .padding(.top, 4)
         }
         .frame(maxWidth: .infinity)
         .padding(.bottom, 8)
@@ -92,6 +100,10 @@ private struct MonitorRow: View {
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.tertiary)
         }
+        // The gap between the text and the chevron isn't part of the
+        // button label otherwise — make the whole row tappable, like the
+        // conversation rows below.
+        .contentShape(Rectangle())
     }
 
     private var subtitle: String {
@@ -116,8 +128,10 @@ private struct ConversationRow: View {
                     Text(conversation.counterparty)
                         .font(.headline)
                     Spacer()
-                    if let last = conversation.lastMessage {
-                        Text(RelativeTime.short(last.timestamp))
+                    // Several CQ threads can share a title — the time is what
+                    // tells them apart, so an empty one dates from its start.
+                    if conversation.lastActivity > .distantPast {
+                        Text(RelativeTime.short(conversation.lastActivity))
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }

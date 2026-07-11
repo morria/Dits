@@ -1,0 +1,21 @@
+# Xcode / build
+build/
+DerivedData/
+*.xcarchive
+*.xcuserstate
+xcuserdata/
+*.moved-aside
+
+# XcodeGen output (regenerated from project.yml)
+app/Dits.xcodeproj/
+
+# SwiftPM
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# TestFlight / export artifacts
+*.ipa
+ExportOptions.plist

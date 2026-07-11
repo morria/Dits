@@ -5,14 +5,20 @@ import SwiftUI
 
 struct ConversationView: View {
     @EnvironmentObject private var radio: RadioController
-    let counterparty: String
+    let conversationID: UUID
 
     @State private var draft = ""
     @FocusState private var composing: Bool
     @State private var sendCount = 0
 
+    /// The thread's station, or "CQ" for a general call. Falls back to "CQ"
+    /// only if the thread was deleted out from under this view.
+    private var counterparty: String {
+        radio.conversation(id: conversationID)?.counterparty ?? "CQ"
+    }
+
     private var messages: [Message] {
-        radio.conversation(for: counterparty)?.messages ?? []
+        radio.conversation(id: conversationID)?.messages ?? []
     }
 
     var body: some View {
@@ -26,7 +32,10 @@ struct ConversationView: View {
                         MessageBubble(
                             message: message,
                             showsTail: isGroupEnd(at: index),
-                            statusCaption: statusCaption(at: index)
+                            statusCaption: statusCaption(at: index),
+                            onResend: message.direction == .transmitted
+                                ? { radio.resend(message.id, in: conversationID) }
+                                : nil
                         )
                         .id(message.id)
                     }
@@ -38,7 +47,7 @@ struct ConversationView: View {
             .defaultScrollAnchor(.bottom)
             .overlay { if messages.isEmpty { emptyState } }
             .onChange(of: messages.count) {
-                radio.markRead(counterparty)
+                radio.markRead(conversationID)
                 scrollToEnd(proxy)
             }
             .onChange(of: composing) { _, focused in
@@ -48,18 +57,79 @@ struct ConversationView: View {
         .navigationTitle(counterparty == "CQ" ? "CQ" : counterparty)
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            ComposeBar(
-                counterparty: counterparty,
-                draft: $draft,
-                composing: $composing,
-                onSent: { sendCount += 1 }
-            )
+            VStack(spacing: 0) {
+                if !radio.liveText.isEmpty { liveCopyStrip }
+                if quietSeconds >= 10 { tuningHint }
+                ComposeBar(
+                    conversationID: conversationID,
+                    draft: $draft,
+                    composing: $composing,
+                    onSent: { sendCount += 1 }
+                )
+            }
         }
         .sensoryFeedback(.impact(weight: .medium), trigger: sendCount)
+        .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
+            // Waiting in a conversation with nothing arriving is where a
+            // mistuned novice actually sits — surface the fix here.
+            if radio.state == .listening && !radio.signalDetected && radio.liveText.isEmpty {
+                quietSeconds += 5
+            } else {
+                quietSeconds = 0
+            }
+        }
         .onAppear {
-            radio.markRead(counterparty)
+            radio.markRead(conversationID)
             prefillIfNeeded()
         }
+    }
+
+    @State private var quietSeconds = 0
+
+    // Copy in progress on the primary channel, pinned above the compose
+    // bar — CW has no addressing, so what the radio hears right now is
+    // exactly what the operator sitting in this thread is waiting on.
+    private var liveCopyStrip: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "dot.radiowaves.left.and.right")
+                .symbolEffect(.pulse, options: .repeating)
+            Text(radio.liveText)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.head)
+            Text("▌")
+                .font(.caption.monospaced())
+            Spacer()
+            if radio.currentWPM > 0 {
+                Text("\(radio.currentWPM) WPM")
+                    .font(.caption2)
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.green)
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private var tuningHint: some View {
+        NavigationLink(value: RootView.Route.monitor) {
+            HStack(spacing: 6) {
+                Image(systemName: "dial.medium")
+                Text("No CW tone near \(radio.settings.toneHz) Hz — tune in the Band Monitor")
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .background(.bar)
+        }
+        .buttonStyle(.plain)
     }
 
     private var emptyState: some View {
@@ -78,9 +148,15 @@ struct ConversationView: View {
 
     // MARK: Behaviour
 
+    /// Open an empty thread with its opening call already in the field —
+    /// never sent, just staged, so the first tap is Send rather than a
+    /// blank page. A CQ thread opens with the general call; a named one
+    /// with a reply to that station.
     private func prefillIfNeeded() {
-        guard draft.isEmpty, messages.isEmpty, counterparty != "CQ" else { return }
-        draft = CWMacros.reply(to: counterparty, callsign: radio.settings.callsign)
+        guard draft.isEmpty, messages.isEmpty else { return }
+        draft = counterparty == "CQ"
+            ? CWMacros.cqCall(callsign: radio.settings.callsign)
+            : CWMacros.reply(to: counterparty, callsign: radio.settings.callsign)
     }
 
     private func scrollToEnd(_ proxy: ScrollViewProxy, animated: Bool = true) {
@@ -116,10 +192,12 @@ struct ConversationView: View {
         switch message.status {
         case .queued:  return "Waiting to send…"
         case .sending: return "Sending…"
-        case .failed:  return "Not Sent"
+        case .failed:  return "Not Sent · Tap to Retry"
         case .sent:
+            // "on air", not "delivered" — CW has no receipts, and the
+            // iMessage framing would promise one.
             let isLastOutgoing = !messages[(index + 1)...].contains { $0.direction == .transmitted }
-            return isLastOutgoing ? "Sent" : nil
+            return isLastOutgoing ? "Sent on air" : nil
         case .received:
             return nil
         }

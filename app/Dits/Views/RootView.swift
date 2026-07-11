@@ -4,13 +4,12 @@ struct RootView: View {
     @EnvironmentObject private var radio: RadioController
 
     enum Route: Hashable {
-        case conversation(String)
+        case conversation(UUID)
         case monitor
     }
 
     @State private var path: [Route] = []
     @State private var showSettings = false
-    @State private var showNewConversation = false
     @State private var showOnboarding = false
 
     var body: some View {
@@ -23,8 +22,8 @@ struct RootView: View {
             .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: Route.self) { route in
                 switch route {
-                case .conversation(let counterparty):
-                    ConversationView(counterparty: counterparty)
+                case .conversation(let id):
+                    ConversationView(conversationID: id)
                 case .monitor:
                     // openConversation (not a bare path append) so the thread
                     // exists and appears in the list even before a first send.
@@ -38,11 +37,16 @@ struct RootView: View {
                     }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { path.append(.monitor) } label: {
-                        Label("Band Monitor", systemImage: "dot.radiowaves.left.and.right")
-                    }
-                    Button { showNewConversation = true } label: {
-                        Label("New Message", systemImage: "square.and.pencil")
+                    // Band Monitor's sole entry point is the pinned home
+                    // row (with its live preview) — one concept, one place.
+                    //
+                    // Straight into a fresh CQ thread: on CW you can't address
+                    // a station you haven't heard, so asking for a callsign
+                    // up front was a question with no useful answer. You
+                    // work stations by answering them (from the monitor or
+                    // an existing thread); a new message is a general call.
+                    Button { path.append(.conversation(radio.startNewConversation())) } label: {
+                        Label("New Call", systemImage: "square.and.pencil")
                     }
                 }
             }
@@ -52,11 +56,6 @@ struct RootView: View {
         }
         .sheet(isPresented: $showSettings) {
             SettingsView()
-        }
-        .sheet(isPresented: $showNewConversation) {
-            NewConversationSheet { counterparty in
-                path.append(.conversation(radio.openConversation(counterparty)))
-            }
         }
         .sheet(isPresented: $showOnboarding) {
             OnboardingSheet()
@@ -86,7 +85,7 @@ struct RootView: View {
             showSettings = true
         case "chat":
             if let first = radio.conversations.first {
-                path = [.conversation(first.counterparty)]
+                path = [.conversation(first.id)]
             }
         default:
             break

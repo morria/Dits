@@ -18,6 +18,43 @@ struct MonitorView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            if radio.isListening {
+                SpectrumStripView()
+                    .padding(.horizontal)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+            }
+            if radio.isRecordingOffAir {
+                recordingBanner
+            }
+            monitorList
+        }
+        .navigationTitle("Band Monitor")
+        .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $filter, prompt: "Filter copy or callsign")
+        .toolbar {
+            Menu {
+                if radio.isListening {
+                    Button {
+                        radio.toggleOffAirRecording()
+                    } label: {
+                        Label(radio.isRecordingOffAir ? "Stop Recording" : "Record Off-Air Audio",
+                              systemImage: radio.isRecordingOffAir ? "stop.circle" : "record.circle")
+                    }
+                }
+                if !radio.monitor.isEmpty {
+                    Button(role: .destructive) { radio.clearMonitor() } label: {
+                        Label("Clear Monitor", systemImage: "trash")
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+        }
+    }
+
+    private var monitorList: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
@@ -30,13 +67,19 @@ struct MonitorView: View {
                         LiveRow(text: radio.liveText, wpm: radio.currentWPM)
                             .id("live")
                     }
+                    // Anchor so we can pin the newest content to the
+                    // bottom only when the list overflows.
+                    Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 6)
             }
-            .defaultScrollAnchor(.bottom)
+            // Top-filling like a log (a freshly cleared or short monitor
+            // reads top-down, not pinned to the bottom edge under the
+            // search bar); jump to newest as content arrives and on open.
             .onChange(of: radio.monitor.count) { scrollToBottom(proxy) }
             .onChange(of: radio.liveText) { scrollToBottom(proxy) }
+            .onAppear { scrollToBottom(proxy, animated: false) }
         }
         .overlay {
             if radio.monitor.isEmpty && radio.liveText.isEmpty {
@@ -46,32 +89,36 @@ struct MonitorView: View {
                     Text(radio.isListening
                          ? "Listening… anything you copy will appear here."
                          : "Start listening to watch the band.")
-                }
-            }
-        }
-        .navigationTitle("Band Monitor")
-        .navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $filter, prompt: "Filter copy or callsign")
-        .toolbar {
-            if !radio.monitor.isEmpty {
-                Menu {
-                    Button(role: .destructive) { radio.clearMonitor() } label: {
-                        Label("Clear Monitor", systemImage: "trash")
+                } actions: {
+                    if !radio.isListening {
+                        Button("Start Listening") { radio.start() }
+                            .buttonStyle(.borderedProminent)
                     }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
                 }
             }
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        withAnimation(.snappy) {
-            if !radio.liveText.isEmpty && filter.isEmpty {
-                proxy.scrollTo("live", anchor: .bottom)
-            } else if let last = filtered.last {
-                proxy.scrollTo(last.id, anchor: .bottom)
-            }
+    private var recordingBanner: some View {
+        HStack(spacing: 6) {
+            Circle().fill(.red).frame(width: 8, height: 8)
+            Text("Recording off-air audio · \(radio.recordingSeconds / 60):\(String(format: "%02d", radio.recordingSeconds % 60))")
+                .monospacedDigit()
+            Spacer()
+            Button("Stop") { radio.stopOffAirRecording() }
+        }
+        .font(.caption)
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+        .background(Color.red.opacity(0.08))
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        // Deferred a tick so the just-appended row is laid out before we
+        // scroll to it (LazyVStack lays out on demand).
+        DispatchQueue.main.async {
+            let scroll = { proxy.scrollTo("bottom", anchor: .bottom) }
+            if animated { withAnimation(.snappy, scroll) } else { scroll() }
         }
     }
 }

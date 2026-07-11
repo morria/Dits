@@ -9,8 +9,16 @@ struct MessageBubble: View {
     var showsTail = true
     /// Delivery caption for the last outgoing message (set by the parent).
     var statusCaption: String?
+    /// Re-key this message (failed sends offer it inline).
+    var onResend: (() -> Void)?
+
+    @State private var showExplanation = false
 
     private var isOutgoing: Bool { message.direction == .transmitted }
+
+    private var explanation: [(term: String, meaning: String)] {
+        CWAbbreviations.explain(message.text)
+    }
 
     var body: some View {
         VStack(alignment: isOutgoing ? .trailing : .leading, spacing: 3) {
@@ -24,7 +32,28 @@ struct MessageBubble: View {
                     BubbleShape(isOutgoing: isOutgoing, hasTail: showsTail)
                         .fill(bubbleColor)
                 )
+                .onTapGesture {
+                    // Failed sends retry on tap, Messages-style.
+                    if message.status == .failed, let onResend {
+                        onResend()
+                    }
+                }
                 .contextMenu {
+                    if !isOutgoing, !explanation.isEmpty {
+                        Button {
+                            withAnimation(.snappy) { showExplanation.toggle() }
+                        } label: {
+                            Label(showExplanation ? "Hide Explanation" : "Explain",
+                                  systemImage: "character.book.closed")
+                        }
+                    }
+                    if isOutgoing, let onResend {
+                        Button {
+                            onResend()
+                        } label: {
+                            Label("Resend", systemImage: "arrow.clockwise")
+                        }
+                    }
                     Button {
                         UIPasteboard.general.string = message.text
                     } label: {
@@ -32,11 +61,32 @@ struct MessageBubble: View {
                     }
                 }
 
+            if showExplanation, !explanation.isEmpty {
+                explanationView
+            }
+
             caption
         }
         .frame(maxWidth: .infinity, alignment: isOutgoing ? .trailing : .leading)
         .padding(isOutgoing ? .leading : .trailing, 56)
         .padding(.bottom, showsTail ? 4 : 0)
+    }
+
+    private var explanationView: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(explanation, id: \.term) { entry in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(entry.term)
+                        .font(.caption.monospaced().weight(.semibold))
+                    Text(entry.meaning)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color(.secondarySystemBackground),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private var bubbleColor: Color {

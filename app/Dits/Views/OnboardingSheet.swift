@@ -11,6 +11,13 @@ struct OnboardingSheet: View {
     @State private var grid = ""
     @State private var fetching = false
 
+    private enum Connection: String, CaseIterable, Identifiable {
+        case radio = "Radio Cable"
+        case morserino = "Morserino"
+        var id: String { rawValue }
+    }
+    @State private var connection: Connection = .radio
+
     private var valid: Bool { CallsignParser.isCallsign(callsign) }
 
     var body: some View {
@@ -20,17 +27,37 @@ struct OnboardingSheet: View {
                     header
 
                     VStack(spacing: 14) {
-                        FeatureRow(icon: "cable.connector", tint: .accentColor,
-                                   title: "Wire up your radio",
-                                   detail: "Connect your iPhone to your rig with a USB-C or Lightning audio interface.")
+                        Picker("How will you connect?", selection: $connection) {
+                            ForEach(Connection.allCases) { choice in
+                                Text(choice.rawValue).tag(choice)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        if connection == .radio {
+                            FeatureRow(icon: "cable.connector", tint: .accentColor,
+                                       title: "Wire up your radio",
+                                       detail: "Connect your iPhone to your rig with a USB-C or Lightning audio interface.")
+                        } else {
+                            FeatureRow(icon: "dot.radiowaves.up.forward", tint: .accentColor,
+                                       title: "Pair your Morserino",
+                                       detail: morserinoDetail)
+                        }
                         FeatureRow(icon: "antenna.radiowaves.left.and.right", tint: .green,
                                    title: "Copy the band",
                                    detail: "Dits decodes incoming Morse into clean, readable text.")
-                        FeatureRow(icon: "paperplane.fill", tint: .orange,
-                                   title: "Send by tapping",
-                                   detail: "Type or tap a macro — Dits keys it out as perfectly timed CW.")
+                        FeatureRow(icon: "person.3", tint: .orange,
+                                   title: "Everyone hears everything",
+                                   detail: "CW is a shared frequency: whatever you send is on the air for all to copy, and replies appear when a station answers you.")
                     }
                     .padding(.horizontal)
+                    .onChange(of: connection) { _, choice in
+                        if choice == .morserino {
+                            radio.morserino.startScanning()
+                        } else {
+                            radio.morserino.stopScanning()
+                        }
+                    }
 
                     VStack(spacing: 12) {
                         TextField("Your callsign", text: $callsign)
@@ -109,6 +136,19 @@ struct OnboardingSheet: View {
                 .multilineTextAlignment(.center)
         }
         .padding(.top)
+    }
+
+    /// Live pairing status inline — with a single Morserino in range the
+    /// auto-connect makes this step zero-tap.
+    private var morserinoDetail: String {
+        switch radio.morserino.connectionState {
+        case .ready:
+            return "Connected to \(radio.morserino.deviceName ?? "your Morserino") ✓"
+        case .scanning, .connecting, .reconnecting:
+            return "Turn the Morserino on — Dits connects automatically."
+        case .idle:
+            return "Dits keys your messages through the Morserino over Bluetooth."
+        }
     }
 
     private func save() {

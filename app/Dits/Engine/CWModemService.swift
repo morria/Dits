@@ -12,7 +12,13 @@ import AmateurDigitalCore
 /// the rest of the app doesn't care which one is selected.
 protocol CWReceiving: AnyObject {
     func process(_ samples: [Float])
-    func reset()
+    /// Clear transient decode state (buffers, half-built characters) while
+    /// preserving calibration: noise floor, signal level, tracked speed,
+    /// and AFC lock. Used when resuming after our own transmission.
+    func resynchronize()
+    /// Reduce DSP cost while the app is backgrounded (no-op for the
+    /// single decoders; the diversity decoder drops to its classic leg).
+    func setLowPower(_ enabled: Bool)
     var estimatedWPM: Double { get }
     var signalStrength: Float { get }
     var toneFrequency: Double { get }
@@ -34,7 +40,8 @@ private final class ClassicReceiver: CWReceiving, CWDemodulatorDelegate {
     }
 
     func process(_ samples: [Float]) { demod.process(samples: samples) }
-    func reset() { demod.reset() }
+    func resynchronize() { demod.resynchronize() }
+    func setLowPower(_ enabled: Bool) {}
     var estimatedWPM: Double { demod.estimatedWPM }
     var signalStrength: Float { demod.signalStrength }
     var toneFrequency: Double { demod.toneFrequency }
@@ -62,7 +69,8 @@ private final class BayesianReceiver: CWReceiving {
     }
 
     func process(_ samples: [Float]) { dec.process(samples: samples) }
-    func reset() { dec.reset() }
+    func resynchronize() { dec.resynchronize() }
+    func setLowPower(_ enabled: Bool) {}
     var estimatedWPM: Double { dec.estimatedWPM }
     var signalStrength: Float { dec.signalStrength }
     var toneFrequency: Double { dec.toneFrequency }
@@ -83,7 +91,8 @@ private final class DiversityReceiver: CWReceiving {
     }
 
     func process(_ samples: [Float]) { dec.process(samples: samples) }
-    func reset() { dec.reset() }
+    func resynchronize() { dec.resynchronize() }
+    func setLowPower(_ enabled: Bool) { dec.lowPowerMode = enabled }
     var estimatedWPM: Double { dec.estimatedWPM }
     var signalStrength: Float { dec.signalStrength }
     var toneFrequency: Double { dec.toneFrequency }
@@ -99,10 +108,16 @@ final class CWModemService {
     private var receiver: CWReceiving
     private var muted = false
 
+    /// Secondary skimmer decoders, keyed by tone frequency. Always the
+    /// classic backend: cheap, and the primary channel runs the good one.
+    private var skimReceivers: [Double: CWReceiving] = [:]
+
     /// char, decoded WPM, signal strength (0–1), tone Hz. Fired on main.
     var onCharacter: ((Character, Double, Float, Double) -> Void)?
     /// Signal detected/lost. Fired on main.
     var onSignal: ((Bool) -> Void)?
+    /// Skimmer copy: char, channel Hz, decoded WPM, signal. Fired on main.
+    var onSkimCharacter: ((Character, Double, Double, Float) -> Void)?
 
     init(settings: StationSettings) {
         receiver = CWModemService.makeReceiver(settings: settings)
@@ -110,15 +125,38 @@ final class CWModemService {
     }
 
     private func wire(_ receiver: CWReceiving) {
-        receiver.onCharacter = { [weak self] character in
-            guard let self else { return }
-            let wpm = self.receiver.estimatedWPM
-            let signal = self.receiver.signalStrength
-            let tone = self.receiver.toneFrequency
+        // Capture the receiver weakly (not through self.receiver): after a
+        // settings rebuild swaps the receiver, a late character from the old
+        // decoder must report the old decoder's WPM/tone, not the new one's.
+        receiver.onCharacter = { [weak self, weak receiver] character in
+            guard let self, let receiver else { return }
+            let wpm = receiver.estimatedWPM
+            let signal = receiver.signalStrength
+            let tone = receiver.toneFrequency
             DispatchQueue.main.async { self.onCharacter?(character, wpm, signal, tone) }
         }
         receiver.onSignal = { [weak self] detected in
             DispatchQueue.main.async { self?.onSignal?(detected) }
+        }
+    }
+
+    /// Point-in-time decoder status for the live meters, delivered on main.
+    /// The character callback only fires when copy decodes — the meters
+    /// need to stay honest between characters too.
+    struct ReceiverStatus {
+        let wpm: Double
+        let signal: Float
+        let toneHz: Double
+    }
+
+    func pollStatus(_ completion: @escaping (ReceiverStatus) -> Void) {
+        queue.async {
+            let status = ReceiverStatus(
+                wpm: self.receiver.estimatedWPM,
+                signal: self.receiver.signalStrength,
+                toneHz: self.receiver.toneFrequency
+            )
+            DispatchQueue.main.async { completion(status) }
         }
     }
 
@@ -156,18 +194,69 @@ final class CWModemService {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
     }
 
+    private var lowPower = false
+
     func feed(_ samples: [Float]) {
         queue.async {
             guard !self.muted else { return }
             self.receiver.process(samples)
+            if !self.lowPower {
+                for skim in self.skimReceivers.values { skim.process(samples) }
+            }
+        }
+    }
+
+    /// Backgrounded: primary channel only, at the diversity decoder's
+    /// classic leg — keeps copy alive within the iOS background CPU
+    /// budget (the watchdog kills sustained >80% of a core).
+    func setLowPower(_ enabled: Bool) {
+        queue.async {
+            self.lowPower = enabled
+            self.receiver.setLowPower(enabled)
         }
     }
 
     /// Mute RX while transmitting so the app doesn't decode its own sidetone.
+    /// On unmute the decoders resynchronize rather than cold-reset: the
+    /// noise floor, tracked speed, and AFC lock measured seconds ago are far
+    /// better estimates than one re-learned while the counterparty is
+    /// already replying.
     func setMuted(_ muted: Bool) {
         queue.async {
+            let wasMuted = self.muted
             self.muted = muted
-            if muted { self.receiver.reset() }
+            if !muted && wasMuted {
+                self.receiver.resynchronize()
+                for skim in self.skimReceivers.values { skim.resynchronize() }
+            }
+        }
+    }
+
+    // MARK: Skimmer channels
+
+    /// Reconcile the set of secondary decoders with the desired channel
+    /// frequencies (from spectrum peak scanning). Existing channels keep
+    /// their decode state; new ones start classic decoders at that tone.
+    func setSkimChannels(_ frequencies: [Double], settings: StationSettings) {
+        queue.async {
+            for hz in self.skimReceivers.keys where !frequencies.contains(hz) {
+                self.skimReceivers.removeValue(forKey: hz)
+            }
+            for hz in frequencies where self.skimReceivers[hz] == nil {
+                var channelSettings = settings
+                channelSettings.toneHz = Int(hz)
+                channelSettings.decoder = .classic
+                let skim = CWModemService.makeReceiver(settings: channelSettings)
+                skim.onCharacter = { [weak self, weak skim] character in
+                    guard let self, let skim else { return }
+                    let wpm = skim.estimatedWPM
+                    let signal = skim.signalStrength
+                    DispatchQueue.main.async {
+                        self.onSkimCharacter?(character, hz, wpm, signal)
+                    }
+                }
+                self.skimReceivers[hz] = skim
+            }
         }
     }
 

@@ -37,6 +37,15 @@ struct StatusBarView: View {
         }
         .background(.bar)
         .animation(.default, value: radio.state)
+        .onTapGesture {
+            // Permission errors are only fixable in Settings — take the
+            // operator straight there instead of describing the journey.
+            if case .error(let message) = radio.state,
+               message.localizedCaseInsensitiveContains("permission"),
+               let url = URL(string: UIApplication.openSettingsURLString) {
+                UIApplication.shared.open(url)
+            }
+        }
     }
 
     private var stateDot: some View {
@@ -61,7 +70,17 @@ struct StatusBarView: View {
             .controlSize(.small)
             .tint(.red)
             .accessibilityLabel("Stop transmitting")
+        case .error:
+            Button { radio.start() } label: {
+                Label("Retry", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
+            .controlSize(.small)
+            .accessibilityLabel("Retry audio")
         default:
+            // Neutral tint: stopping the receiver is pause semantics, not
+            // destruction — red stays reserved for aborting a transmission.
             Button { radio.toggleListening() } label: {
                 Label(radio.isListening ? "Stop" : "Listen",
                       systemImage: radio.isListening ? "stop.fill" : "play.fill")
@@ -69,7 +88,7 @@ struct StatusBarView: View {
             .buttonStyle(.bordered)
             .buttonBorderShape(.capsule)
             .controlSize(.small)
-            .tint(radio.isListening ? .red : .accentColor)
+            .tint(.accentColor)
             .accessibilityLabel(radio.isListening ? "Stop listening" : "Start listening")
         }
     }
@@ -95,15 +114,24 @@ struct StatusBarView: View {
         case .paused:
             return "Audio interrupted — resuming automatically"
         case .transmitting:
-            return "Keying at \(radio.settings.wpm) WPM · receive muted"
+            return radio.morserino.isReady
+                ? "Keying via Morserino at \(radio.settings.wpm) WPM"
+                : "Keying at \(radio.settings.wpm) WPM · receive muted"
         case .listening:
             if !radio.liveText.isEmpty { return radio.liveText }
-            if radio.currentWPM > 0, radio.detectedToneHz > 0 {
-                // What we're actually copying: decoded speed + AFC-tracked tone.
-                return "\(radio.currentWPM) WPM · \(radio.detectedToneHz) Hz"
+            if radio.signalDetected, radio.currentWPM > 0, radio.detectedToneHz > 0 {
+                // Speed, tone, and a plain-language read on conditions.
+                return "\(radio.currentWPM) WPM · \(radio.detectedToneHz) Hz · \(copyQuality)"
             }
             return "Waiting for a signal · \(radio.settings.toneHz) Hz"
         }
+    }
+
+    /// Conditions in words a novice can act on, not S-units.
+    private var copyQuality: String {
+        if radio.signalStrength > 0.66 { return "strong copy" }
+        if radio.signalStrength > 0.33 { return "workable" }
+        return "weak copy"
     }
 
     private var dotColor: Color {
