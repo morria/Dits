@@ -136,24 +136,95 @@ unless noted):
   channel (room impulses, level wander, tonal flutter) silent — the
   old SNR gates only handled stationary noise.
 
+## Provisional → revised copy (2026-09-07)
+
+`CWModemService` runs every backend behind `RevisingCWDecoder` (see the
+Amateur-Digital notes): the app consumes `CWTextEvent`s, not characters.
+`RadioController` keeps the pending copy as `[CopySegment]` (decoder
+segment id, text, isFinal); `liveText` is the segments joined with
+spaces. `commitSegment()` calls `modem.markBoundary()` so no revision
+straddles a message, and a committed message whose segments aren't all
+final is registered in `provisionalMessages` / `segmentHomes` — every
+thread's copy shares one `Message.id` — so a later `.revise` rewrites
+the bubble text and callsign in place (and the monitor entry), and
+`.finalize` clears `Message.provisionalFrom`, the offset from which the
+text renders gray (`MessageBubble.bubbleText`; `DecodeEntry.isProvisional`
+for the monitor). Provisional marks never survive relaunch
+(`sanitized`), expire after 60 s, and are settled by `flushPending()` on
+Stop and at TX mute. Revisions don't re-route a message; they only
+correct it where it landed. `applyTextEvent` / `commitSegment` are
+internal so `ProvisionalCopyTests` can drive the lifecycle without audio.
+
 ## App receive/TX extras
 
-- Spectrum strip (300–1100 Hz, tap-to-tune) atop the Band Monitor;
+- Spectrum strip (300–1100 Hz, tap-to-tune) atop the Band Monitor,
+  with a frequency scale, the tuned tone labelled, and the decoder's
+  capture band (`RadioController.captureHalfWidthHz` = ±100 Hz: the
+  receive bandpass; AFC only hunts once something inside it bootstraps)
+  shaded — a peak outside the shading will never decode. A tuning row
+  under the strip states "Tuned N Hz · ±100 Hz" and holds the skimmer
+  toggle; `strongestPeakHz` (a peak sustained ~0.4 s) drives an
+  off-tune hint with a one-tap Tune when nothing is being copied.
   `SpectrumAnalyzer` also feeds an optional 2-channel skimmer
-  (`settings.skimmerEnabled`) that decodes off-channel signals into the
-  monitor. Live meters poll the decoder at 2.5 Hz.
+  (`settings.skimmerEnabled`, also in the monitor's toolbar menu) whose
+  channels (`skimChannelsHz`) are drawn orange on the strip and badge
+  their monitor rows. Live meters poll the decoder at 2.5 Hz, including
+  `hearingKeying` (elements accepted by the gate with no character out
+  for ≥3 elements within 2 s: probation holding or junk dropped) shown
+  as an "ear" row / empty state / status subline so a lively band with
+  no copy is never silent.
+- The monitor never hides copy: lone characters land as `isNoise`
+  (faint, "probably noise"), copy that reached no thread is labelled
+  "monitor only", skimmer copy is badged. Lone characters route only
+  into the thread on screen, never via the QSO/CQ windows.
 - Morserino-32 BLE keyer (`Morserino/MorserinoKeyer.swift`, NUS +
   m32 protocol): when connected, `RadioController.transmit` routes text
   to `PUT cw/play/...` instead of the audio path; Settings → Keyer.
+  The Nordic UART Service is generic, so auto-connect is name-gated
+  (`looksLikeMorserino`: "Morserino"/"M32" prefixes); anything else in
+  the list needs a tap. Silent reconnect happens only after a session
+  was established, at most 3 times with backoff, never on pairing
+  errors — otherwise a stranger's device that wants pairing loops the
+  system pairing sheet. A remembered id whose automatic connect fails
+  is forgotten; the screen has Forget Remembered Device.
 - Template messages (`QuickMessage`, Settings → Messages) with {CALL}
   {NAME} {QTH} {GRID} {THEIRCALL} placeholders fill the compose field;
   an empty compose field turns Send into repeat-last-sent.
 - Active-QSO routing: keying to a counterparty (or a parsed "DE call")
   opens a 5-minute window during which substantial unparsed copy routes
   into that thread — mid-QSO overs drop the "DE" prefix. Junk-gated by
-  `isSubstantialCopy` (≥4 chars, <70% E/I/S/H/5/T). ConversationView
-  pins a live copy strip above the compose bar while decode is in
-  progress.
+  `isSubstantialCopy` (≥4 chars, <70% E/I/S/H/5/T).
+- **The thread on screen always receives.** `ConversationView` reports
+  itself via `setVisibleConversation` / `clearVisibleConversation`;
+  while a thread is visible, *all* primary-channel copy lands there
+  (no junk gate, even a lone "R"), a parsed "DE call" for another
+  station is filed in that station's thread too, and opening a thread
+  activates it like keying does. Skimmer copy (`commitCopy(channel:
+  .skimmer)`) never enters the visible thread. `liveDestinationID`
+  predicts where `liveText` will commit (same policy, see
+  `liveDestination(for:)`), so the thread shows the in-progress copy as
+  a gray `ProvisionalBubble` at the end of the transcript that is
+  replaced in place by the committed bubble (black where final, gray
+  where the decoder may still revise); the list row and the monitor's
+  live row use the same gray-means-provisional convention.
+
+## Product-design pass (2026-09-13)
+
+- `StatusBarView` (state, live readout, Listen/Stop) is a top
+  `safeAreaInset` on every screen — home, Band Monitor, and threads —
+  not only the list.
+- Being called is the headline event: `RadioController.incomingCall` is
+  set when primary-channel copy reads "<my call> DE <them>" for a thread
+  not on screen (haptic, 30 s lifetime, cleared when that thread is
+  opened); the status strip shows a green "K1ABC is calling you" banner
+  that is a `NavigationLink` to the thread, so it works from anywhere.
+- CQ threads are titled "Calling CQ" with a megaphone, in the list and
+  the thread title.
+- First run: dismissing onboarding with a callsign set starts listening
+  and lands on the Band Monitor.
+- Monitor rows no longer carry a "monitor only" caption (unrouted is the
+  norm in a raw feed); noise and skimmer badges stay.
+- Not done (bigger refactors): iPad split view, a Band/Chats tab bar.
 
 ## Deploy
 

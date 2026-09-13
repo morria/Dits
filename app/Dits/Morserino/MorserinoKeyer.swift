@@ -27,6 +27,17 @@ final class MorserinoKeyer: NSObject, ObservableObject {
         let id: UUID
         let name: String
         let rssi: Int
+        /// Advertises as a Morserino. The Nordic UART Service is a generic
+        /// serial profile shared by countless hobby boards and
+        /// accessories; only a device that says it's a Morserino may be
+        /// connected to without the operator tapping it.
+        var isMorserino: Bool { MorserinoKeyer.looksLikeMorserino(name) }
+    }
+
+    static func looksLikeMorserino(_ name: String?) -> Bool {
+        guard let name else { return false }
+        let lower = name.lowercased()
+        return lower.hasPrefix("morserino") || lower.hasPrefix("m32")
     }
 
     // MARK: - Nordic UART Service
@@ -48,6 +59,9 @@ final class MorserinoKeyer: NSObject, ObservableObject {
     @Published private(set) var keyerMenuAvailable = false
 
     var isReady: Bool { connectionState == .ready }
+
+    /// A previously used Morserino is on file for zero-tap reconnect.
+    var hasRememberedDevice: Bool { rememberedDeviceID != nil }
 
     /// Raw keyed-character echo from the device (keying progress).
     var onKeyingEcho: ((String) -> Void)?
@@ -79,6 +93,18 @@ final class MorserinoKeyer: NSObject, ObservableObject {
     /// An explicit Disconnect holds for the rest of the session — the
     /// quiet foreground reconnect must not undo the operator's choice.
     private var userDisconnected = false
+    /// The current connect was started by auto-connect, not a tap. A
+    /// failure then must not be retried against the operator's wishes,
+    /// and a remembered id that fails is forgotten.
+    private var automaticConnect = false
+    /// The link reached a working session at least once. Only such a
+    /// link is worth reattaching silently: a drop before that is a
+    /// failed handshake (a device that wants pairing, isn't a Morserino,
+    /// or refused), and retrying it re-raises the pairing sheet forever.
+    private var sessionEstablished = false
+    private var reconnectAttempts = 0
+    private static let maxReconnectAttempts = 3
+    private var reconnectWork: DispatchWorkItem?
 
     private static let rememberedDeviceKey = "morserino.lastDeviceID"
 
@@ -136,8 +162,14 @@ final class MorserinoKeyer: NSObject, ObservableObject {
     }
 
     func connect(_ device: Device) {
+        connect(device, automatic: false)
+    }
+
+    private func connect(_ device: Device, automatic: Bool) {
         guard let central, let target = knownPeripherals[device.id] else { return }
         userDisconnected = false
+        automaticConnect = automatic
+        sessionEstablished = false
         singleDeviceTimer?.cancel()
         singleDeviceTimer = nil
         scanStopTimer?.cancel()
@@ -157,6 +189,7 @@ final class MorserinoKeyer: NSObject, ObservableObject {
             if let pending = self.connectingID, let p = self.knownPeripherals[pending] {
                 central.cancelPeripheralConnection(p)
             }
+            self.abandonAutomaticTarget()
             self.connectingID = nil
             self.connectionState = .idle
         }
@@ -167,12 +200,22 @@ final class MorserinoKeyer: NSObject, ObservableObject {
 
     func disconnect() {
         userDisconnected = true
+        reconnectWork?.cancel()
+        reconnectWork = nil
         // Cancel a pending auto-reconnect (link already down).
-        if connectionState == .reconnecting, let central,
-           let id = connectingID, let pending = knownPeripherals[id] {
-            central.cancelPeripheralConnection(pending)
+        if connectionState == .reconnecting, let central {
+            if let id = connectingID, let pending = knownPeripherals[id] {
+                central.cancelPeripheralConnection(pending)
+            }
             connectingID = nil
             connectionState = .idle
+            return
+        }
+        // Abort a connect that never completed (a pairing sheet still up).
+        if connectionState == .connecting, let central,
+           let id = connectingID, let pending = knownPeripherals[id] {
+            central.cancelPeripheralConnection(pending)
+            cleanupConnection(fireDisconnect: false)
             return
         }
         guard let central, let p = peripheral else { return }
@@ -180,6 +223,32 @@ final class MorserinoKeyer: NSObject, ObservableObject {
         // Give the goodbye a moment to flush before dropping the link.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             central.cancelPeripheralConnection(p)
+        }
+    }
+
+    /// Drop the remembered Morserino so nothing reconnects on its own,
+    /// and end any link or attempt in progress.
+    func forgetDevice() {
+        rememberedDeviceID = nil
+        disconnect()
+    }
+
+    /// An automatic connect to the remembered device failed: it is not
+    /// (or no longer) a device this app should reach for by itself.
+    private func abandonAutomaticTarget() {
+        guard automaticConnect, let id = connectingID, id == rememberedDeviceID else { return }
+        rememberedDeviceID = nil
+    }
+
+    /// Errors CoreBluetooth reports when the peer wanted pairing that
+    /// didn't happen — never worth an automatic retry.
+    private static func isPairingFailure(_ error: Error?) -> Bool {
+        guard let error = error as? CBError else { return false }
+        switch error.code {
+        case .peerRemovedPairingInformation, .encryptionTimedOut:
+            return true
+        default:
+            return false
         }
     }
 
@@ -396,7 +465,7 @@ extension MorserinoKeyer: CBCentralManagerDelegate {
         knownPeripherals[peripheral.identifier] = peripheral
         let name = peripheral.name
             ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
-            ?? "Morserino"
+            ?? "Unnamed device"
         let device = Device(id: peripheral.identifier, name: name, rssi: RSSI.intValue)
         if let index = devices.firstIndex(where: { $0.id == device.id }) {
             devices[index] = device
@@ -407,17 +476,23 @@ extension MorserinoKeyer: CBCentralManagerDelegate {
 
         guard autoConnectArmed else { return }
         if device.id == rememberedDeviceID {
-            // The device we've used before — reattach immediately.
-            connect(device)
-        } else if singleDeviceTimer == nil {
-            // Unknown device(s): give discovery a moment to settle, then
-            // connect only if exactly one is in range (no ambiguity).
+            // The device we've used before — reattach immediately. Unless
+            // it isn't a Morserino: a remembered id from before names
+            // were checked could be any UART gadget nearby.
+            guard device.isMorserino else {
+                rememberedDeviceID = nil
+                return
+            }
+            connect(device, automatic: true)
+        } else if device.isMorserino, singleDeviceTimer == nil {
+            // Unknown Morserino(s): give discovery a moment to settle,
+            // then connect only if exactly one is in range (no ambiguity).
             let work = DispatchWorkItem { [weak self] in
                 guard let self, self.autoConnectArmed,
-                      self.connectionState == .scanning,
-                      self.devices.count == 1,
-                      let only = self.devices.first else { return }
-                self.connect(only)
+                      self.connectionState == .scanning else { return }
+                let candidates = self.devices.filter(\.isMorserino)
+                guard candidates.count == 1, let only = candidates.first else { return }
+                self.connect(only, automatic: true)
             }
             singleDeviceTimer = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
@@ -439,24 +514,43 @@ extension MorserinoKeyer: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral, error: Error?) {
         guard peripheral.identifier == connectingID else { return }
+        abandonAutomaticTarget()
         cleanupConnection(fireDisconnect: false)
     }
 
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         guard peripheral.identifier == self.peripheral?.identifier else { return }
+        let hadSession = sessionEstablished
         let unexpected = !userDisconnected
+        if unexpected, !hadSession { abandonAutomaticTarget() }
         cleanupConnection(fireDisconnect: true)
-        if unexpected {
-            // BLE links to the Morserino drop easily (range, sleep). A
-            // pending connect on the same peripheral never times out at
-            // the system level and reattaches the instant the device is
-            // seen again — the canonical CoreBluetooth auto-reconnect.
-            connectionState = .reconnecting
-            connectingID = peripheral.identifier
-            deviceName = peripheral.name ?? deviceName
+
+        // BLE links to the Morserino drop easily (range, sleep). A
+        // pending connect on the same peripheral never times out at the
+        // system level and reattaches the instant the device is seen
+        // again — the canonical CoreBluetooth auto-reconnect. Only for a
+        // link that actually worked, never for a refused pairing, and
+        // only a few times: a device that keeps dropping is not one to
+        // keep prodding (each prod can raise a system pairing sheet).
+        guard unexpected, hadSession, !Self.isPairingFailure(error),
+              reconnectAttempts < Self.maxReconnectAttempts else {
+            reconnectAttempts = 0
+            return
+        }
+        reconnectAttempts += 1
+        connectionState = .reconnecting
+        connectingID = peripheral.identifier
+        deviceName = peripheral.name ?? deviceName
+        let attempt = reconnectAttempts
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.connectionState == .reconnecting,
+                  self.connectingID == peripheral.identifier else { return }
             central.connect(peripheral)
         }
+        reconnectWork?.cancel()
+        reconnectWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Double(attempt), execute: work)
     }
 }
 
@@ -487,6 +581,8 @@ extension MorserinoKeyer: CBPeripheralDelegate {
               characteristic.isNotifying,
               rxCharacteristic != nil else { return }
         connectionState = .ready
+        sessionEstablished = true
+        reconnectAttempts = 0
         rememberedDeviceID = peripheral.identifier
         startSession()
     }

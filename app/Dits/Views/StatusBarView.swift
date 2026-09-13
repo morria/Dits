@@ -33,10 +33,16 @@ struct StatusBarView: View {
             }
             .padding(.horizontal)
             .padding(.vertical, 7)
+            // Below the status row, not above it: content directly under
+            // the translucent navigation bar tints the whole header.
+            if let call = radio.incomingCall {
+                callingBanner(call)
+            }
             Divider()
         }
         .background(.bar)
         .animation(.default, value: radio.state)
+        .animation(.snappy, value: radio.incomingCall)
         .onTapGesture {
             // Permission errors are only fixable in Settings — take the
             // operator straight there instead of describing the journey.
@@ -46,6 +52,31 @@ struct StatusBarView: View {
                 UIApplication.shared.open(url)
             }
         }
+    }
+
+    /// "K1ABC is calling you" — one tap opens the thread. A NavigationLink
+    /// so it works from every screen inside the stack.
+    private func callingBanner(_ call: RadioController.IncomingCall) -> some View {
+        NavigationLink(value: RootView.Route.conversation(call.conversationID)) {
+            HStack(spacing: 8) {
+                Image(systemName: "phone.arrow.down.left.fill")
+                    .symbolEffect(.pulse, options: .repeating)
+                Text("\(call.callsign) is calling you")
+                    .font(.footnote.weight(.semibold))
+                Spacer()
+                Text("Open")
+                    .font(.footnote.weight(.semibold))
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.bold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .background(Color.green.gradient)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(call.callsign) is calling you. Opens the conversation.")
+        .transition(.move(edge: .top).combined(with: .opacity))
     }
 
     private var stateDot: some View {
@@ -119,11 +150,15 @@ struct StatusBarView: View {
                 : "Keying at \(radio.settings.wpm) WPM · receive muted"
         case .listening:
             if !radio.liveText.isEmpty { return radio.liveText }
+            if radio.hearingKeying { return "Hearing keying · waiting for clean CW" }
+            if let peak = radio.offTunePeakHz {
+                return "Strong signal at \(peak) Hz · tuned to \(radio.settings.toneHz) Hz"
+            }
             if radio.signalDetected, radio.currentWPM > 0, radio.detectedToneHz > 0 {
                 // Speed, tone, and a plain-language read on conditions.
                 return "\(radio.currentWPM) WPM · \(radio.detectedToneHz) Hz · \(copyQuality)"
             }
-            return "Waiting for a signal · \(radio.settings.toneHz) Hz"
+            return "Waiting for a signal · tuned to \(radio.settings.toneHz) Hz"
         }
     }
 

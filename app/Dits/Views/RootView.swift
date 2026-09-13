@@ -57,7 +57,13 @@ struct RootView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView()
         }
-        .sheet(isPresented: $showOnboarding) {
+        .sheet(isPresented: $showOnboarding, onDismiss: {
+            // First run ends on the live band, listening — not an empty
+            // list one tap away from the thing the app is for.
+            guard radio.settings.isConfigured, path.isEmpty else { return }
+            radio.startIfNeeded()
+            path = [.monitor]
+        }) {
             OnboardingSheet()
         }
         .onAppear {

@@ -39,26 +39,38 @@ struct ConversationView: View {
                         )
                         .id(message.id)
                     }
+                    // Copy in progress, right where it will land. Gray
+                    // until the segment commits, when the same words
+                    // reappear as a real (black) bubble in its place.
+                    if showsLiveCopy {
+                        ProvisionalBubble(text: radio.liveText, wpm: radio.currentWPM)
+                            .id(liveBubbleID)
+                            .transition(.opacity)
+                    }
                 }
                 .padding(.horizontal)
                 .padding(.top, 8)
+                .animation(.easeInOut(duration: 0.15), value: showsLiveCopy)
             }
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
-            .overlay { if messages.isEmpty { emptyState } }
+            .overlay { if messages.isEmpty && !showsLiveCopy { emptyState } }
             .onChange(of: messages.count) {
                 radio.markRead(conversationID)
                 scrollToEnd(proxy)
+            }
+            .onChange(of: radio.liveText) {
+                if showsLiveCopy { scrollToEnd(proxy) }
             }
             .onChange(of: composing) { _, focused in
                 if focused { scrollToEnd(proxy, animated: true) }
             }
         }
-        .navigationTitle(counterparty == "CQ" ? "CQ" : counterparty)
+        .navigationTitle(counterparty == "CQ" ? "Calling CQ" : counterparty)
         .navigationBarTitleDisplayMode(.inline)
+        .safeAreaInset(edge: .top, spacing: 0) { StatusBarView() }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
-                if !radio.liveText.isEmpty { liveCopyStrip }
                 if quietSeconds >= 10 { tuningHint }
                 ComposeBar(
                     conversationID: conversationID,
@@ -79,37 +91,22 @@ struct ConversationView: View {
             }
         }
         .onAppear {
+            // The open thread is where copy goes — see RadioController.
+            radio.setVisibleConversation(conversationID)
             radio.markRead(conversationID)
             prefillIfNeeded()
+        }
+        .onDisappear {
+            radio.clearVisibleConversation(conversationID)
         }
     }
 
     @State private var quietSeconds = 0
+    private let liveBubbleID = "live-copy"
 
-    // Copy in progress on the primary channel, pinned above the compose
-    // bar — CW has no addressing, so what the radio hears right now is
-    // exactly what the operator sitting in this thread is waiting on.
-    private var liveCopyStrip: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Image(systemName: "dot.radiowaves.left.and.right")
-                .symbolEffect(.pulse, options: .repeating)
-            Text(radio.liveText)
-                .font(.caption.monospaced())
-                .lineLimit(1)
-                .truncationMode(.head)
-            Text("▌")
-                .font(.caption.monospaced())
-            Spacer()
-            if radio.currentWPM > 0 {
-                Text("\(radio.currentWPM) WPM")
-                    .font(.caption2)
-            }
-        }
-        .font(.caption)
-        .foregroundStyle(.green)
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-        .background(.bar)
+    /// Copy is being decoded and this thread is where it will land.
+    private var showsLiveCopy: Bool {
+        !radio.liveText.isEmpty && radio.liveDestinationID == conversationID
     }
 
     private var tuningHint: some View {
@@ -160,11 +157,22 @@ struct ConversationView: View {
     }
 
     private func scrollToEnd(_ proxy: ScrollViewProxy, animated: Bool = true) {
-        guard let last = messages.last else { return }
-        if animated {
-            withAnimation(.snappy) { proxy.scrollTo(last.id, anchor: .bottom) }
+        let target: AnyHashable
+        if showsLiveCopy {
+            target = liveBubbleID
+        } else if let last = messages.last {
+            target = last.id
         } else {
-            proxy.scrollTo(last.id, anchor: .bottom)
+            return
+        }
+        // Deferred a tick so a just-appended row is laid out before we
+        // scroll to it (LazyVStack lays out on demand).
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.snappy) { proxy.scrollTo(target, anchor: .bottom) }
+            } else {
+                proxy.scrollTo(target, anchor: .bottom)
+            }
         }
     }
 

@@ -22,7 +22,7 @@ struct MessageBubble: View {
 
     var body: some View {
         VStack(alignment: isOutgoing ? .trailing : .leading, spacing: 3) {
-            Text(message.text)
+            bubbleText
                 .font(.callout.monospaced())
                 .textSelection(.enabled)
                 .padding(.horizontal, 12)
@@ -72,6 +72,16 @@ struct MessageBubble: View {
         .padding(.bottom, showsTail ? 4 : 0)
     }
 
+    /// Copy the decoder may still revise reads gray; it turns black in
+    /// place as the decoder finalizes it.
+    private var bubbleText: Text {
+        guard !isOutgoing, let from = message.provisionalFrom,
+              from < message.text.count else { return Text(message.text) }
+        let split = message.text.index(message.text.startIndex, offsetBy: max(from, 0))
+        return Text(String(message.text[..<split]))
+            + Text(String(message.text[split...])).foregroundColor(.secondary)
+    }
+
     private var explanationView: some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(explanation, id: \.term) { entry in
@@ -110,6 +120,10 @@ struct MessageBubble: View {
                 if let signal = message.signal {
                     SignalBars(strength: signal, tint: .signal(signal))
                 }
+                // Gray text alone shouldn't carry the meaning.
+                if message.provisionalFrom != nil {
+                    Text("· still decoding")
+                }
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -130,6 +144,45 @@ struct MessageBubble: View {
         .font(.caption2.weight(.medium))
         .foregroundStyle(message.status == .failed ? .red : .secondary)
         .padding(.bottom, 4)
+    }
+}
+
+/// Copy still being decoded: an incoming bubble drawn in gray so it reads
+/// as tentative. The text grows (and may be revised) character by
+/// character; when the segment commits it is replaced in place by a real
+/// `MessageBubble`, which is what turns it black.
+struct ProvisionalBubble: View {
+    let text: String
+    var wpm: Int = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            // Cursor is part of the same run so it wraps with the words.
+            (Text(text).foregroundColor(.secondary) + Text(" ▌").foregroundColor(.green))
+                .font(.callout.monospaced())
+                .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(
+                BubbleShape(isOutgoing: false, hasTail: true)
+                    .fill(Color(.systemGray6))
+                    .overlay(
+                        BubbleShape(isOutgoing: false, hasTail: true)
+                            .stroke(Color(.systemGray4), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                    )
+            )
+
+            Label("Copying…\(wpm > 0 ? " · \(wpm) WPM" : "")",
+                  systemImage: "dot.radiowaves.left.and.right")
+                .symbolEffect(.variableColor.iterative, options: .repeating)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.green)
+                .padding(.bottom, 4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.trailing, 56)
+        .padding(.bottom, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Copying: \(text)")
     }
 }
 

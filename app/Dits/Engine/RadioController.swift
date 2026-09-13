@@ -28,6 +28,18 @@ final class RadioController: ObservableObject {
     @Published private(set) var monitor: [DecodeEntry] = []
     /// Copy currently being decoded, before it's committed to the monitor.
     @Published private(set) var liveText: String = ""
+    /// The thread `liveText` will land in when it commits, so that thread
+    /// (and its row in the list) can show the copy in progress as a
+    /// provisional bubble. Nil when no thread would receive it.
+    @Published private(set) var liveDestinationID: UUID?
+
+    /// The thread the operator is looking at right now. CW carries no
+    /// addressing, so whatever the radio hears while a thread is open is
+    /// by definition what the operator is waiting on: primary-channel copy
+    /// always lands here, whatever the callsign parser makes of it, and
+    /// without the junk gate — the operator is watching, and copy that
+    /// showed provisionally must never vanish on commit.
+    private(set) var visibleConversationID: UUID?
 
     @Published private(set) var inputLevel: Float = 0
     @Published private(set) var currentWPM: Int = 0
@@ -37,6 +49,56 @@ final class RadioController: ObservableObject {
     @Published private(set) var detectedToneHz: Int = 0
     /// Live 300–1100 Hz band magnitudes (0–1) for the tuning strip.
     @Published private(set) var spectrum: [Float] = []
+    /// Strongest sustained peak in the band, snapped to 10 Hz — what the
+    /// operator is most likely looking at on the strip.
+    @Published private(set) var strongestPeakHz: Int?
+    /// Frequencies the skimmer is currently decoding, if enabled.
+    @Published private(set) var skimChannelsHz: [Int] = []
+    /// Keying is being heard on the tuned frequency but the decoder is
+    /// holding or discarding it — not (yet) clean CW rhythm.
+    @Published private(set) var hearingKeying = false
+
+    /// A station just addressed this operator by callsign ("<me> DE
+    /// <them>"): the headline event of operating, surfaced everywhere
+    /// until the thread is opened or it goes stale.
+    struct IncomingCall: Equatable {
+        let callsign: String
+        let conversationID: UUID
+        let at: Date
+    }
+    @Published private(set) var incomingCall: IncomingCall?
+    private static let incomingCallLifetime: TimeInterval = 30
+
+    private func noteIncomingCall(_ callsign: String, text: String, conversationID: UUID) {
+        let mine = CallsignParser.normalized(settings.callsign)
+        guard !mine.isEmpty, callsign != mine else { return }
+        // Addressed to me: my call appears before the "DE".
+        let tokens = text.uppercased().split { !($0.isLetter || $0.isNumber || $0 == "/") }.map(String.init)
+        guard let de = tokens.firstIndex(of: "DE"), tokens[..<de].contains(mine) else { return }
+        guard visibleConversationID != conversationID else { return }
+        incomingCall = IncomingCall(callsign: callsign, conversationID: conversationID, at: Date())
+        Haptics.impact(.rigid)
+        DispatchQueue.main.asyncAfter(deadline: .now() + RadioController.incomingCallLifetime) { [weak self] in
+            guard let self, let call = self.incomingCall,
+                  Date().timeIntervalSince(call.at) >= RadioController.incomingCallLifetime - 0.5 else { return }
+            self.incomingCall = nil
+        }
+    }
+
+    /// How far from the tuned tone the decoder can still acquire a
+    /// signal: the receive bandpass is ±100 Hz, and AFC only starts
+    /// hunting once something inside it bootstraps the detector.
+    static let captureHalfWidthHz = 100
+
+    /// A strong peak the decoder can't reach from where it's tuned, with
+    /// nothing being copied — the single most common "it shows on the
+    /// spectrum but decodes nothing" cause.
+    var offTunePeakHz: Int? {
+        guard isListening, !signalDetected, liveText.isEmpty,
+              let peak = strongestPeakHz,
+              abs(peak - settings.toneHz) > RadioController.captureHalfWidthHz else { return nil }
+        return peak
+    }
     /// Off-air recording in progress (field diagnostics).
     @Published private(set) var isRecordingOffAir = false
     @Published private(set) var recordingSeconds = 0
@@ -62,8 +124,31 @@ final class RadioController: ObservableObject {
 
     // MARK: RX accumulation
 
-    private var pendingSegment = ""
+    /// One unit of provisional copy from the revising decoder: a run of
+    /// keying the decoder may still rewrite as a whole until it is
+    /// finalized. Ids are the decoder's segment ids.
+    struct CopySegment: Equatable {
+        let id: Int
+        var text: String
+        var isFinal: Bool
+    }
+
+    /// Copy not yet committed to a message, oldest first.
+    private var pendingSegments: [CopySegment] = []
     private var commitWork: DispatchWorkItem?
+
+    /// Committed messages the decoder may still revise: the segments
+    /// they were built from, every thread holding a copy, and the monitor
+    /// entry. Cleared once every segment is finalized.
+    private struct ProvisionalMessage {
+        var segments: [CopySegment]
+        var conversationIDs: [UUID]
+        var monitorEntryID: UUID?
+        let committedAt: Date
+    }
+    private var provisionalMessages: [UUID: ProvisionalMessage] = [:]
+    /// Decoder segment id → committed message holding it.
+    private var segmentHomes: [Int: UUID] = [:]
     private let maxMonitorEntries = 400
     private let maxMessagesPerConversation = 500
 
@@ -113,8 +198,9 @@ final class RadioController: ObservableObject {
             DispatchQueue.main.async { self?.inputLevel = level }
         }
         spectrumAnalyzer?.onFrame = { [weak self] frame in
-            guard let self, self.isListening else { return }
+            guard let self, self.isListening, !self.demoFrozen else { return }
             self.spectrum = frame.normalized
+            self.trackStrongestPeak(frame)
             self.skim(frame)
         }
         startMeterPolling()
@@ -150,11 +236,12 @@ final class RadioController: ObservableObject {
         audio.onRuntimeEvent = { [weak self] event in
             self?.handleAudioRuntimeEvent(event)
         }
-        modem.onCharacter = { [weak self] character, wpm, signal, tone in
-            self?.handleCharacter(character, wpm: wpm, signal: signal, tone: tone)
+        modem.onTextEvent = { [weak self] event, wpm, signal, tone in
+            self?.handleTextEvent(event, wpm: wpm, signal: signal, tone: tone)
         }
         modem.onSignal = { [weak self] detected in
-            self?.signalDetected = detected
+            guard let self, !self.demoFrozen else { return }
+            self.signalDetected = detected
         }
         modem.onSkimCharacter = { [weak self] character, channelHz, wpm, signal in
             self?.handleSkimCharacter(character, channelHz: channelHz, wpm: wpm, signal: signal)
@@ -188,18 +275,44 @@ final class RadioController: ObservableObject {
         dl.messages = [
             Message(text: "CQ DX CQ DX DE DL1ABC K", timestamp: now.addingTimeInterval(-200),
                     direction: .received, status: .received, callsign: "DL1ABC", wpm: 26, toneHz: 600, signal: 52),
+            // Committed, with its tail still open to revision (gray).
+            Message(text: "W2ASM DE DL1ABC = GM TNX CALL", timestamp: now.addingTimeInterval(-9),
+                    direction: .received, status: .received, callsign: "DL1ABC", wpm: 26, toneHz: 600, signal: 55,
+                    provisionalFrom: "W2ASM DE DL1ABC = ".count),
         ]
         conversations = [k1, dl]
         sortConversations()
         monitor = [
             DecodeEntry(text: "CQ DX DE DL1ABC DL1ABC K", timestamp: now.addingTimeInterval(-90),
-                        wpm: 26, signal: 52, toneHz: 600, callsign: "DL1ABC"),
+                        wpm: 26, signal: 52, toneHz: 600, callsign: "DL1ABC", routed: true),
             DecodeEntry(text: "W2ASM DE K1ABC R FB", timestamp: now.addingTimeInterval(-45),
-                        wpm: 23, signal: 72, toneHz: 600, callsign: "K1ABC"),
+                        wpm: 23, signal: 72, toneHz: 600, callsign: "K1ABC", routed: true),
+            DecodeEntry(text: "CQ TEST DE W1XYZ", timestamp: now.addingTimeInterval(-30),
+                        wpm: 28, signal: 40, toneHz: 950, callsign: "W1XYZ", isSkimmed: true, routed: true),
+            DecodeEntry(text: "E", timestamp: now.addingTimeInterval(-20),
+                        wpm: 18, signal: 12, toneHz: 600, isNoise: true),
             DecodeEntry(text: "QRL? DE N0CALL", timestamp: now.addingTimeInterval(-12),
-                        wpm: 18, signal: 28, toneHz: 600, callsign: "N0CALL"),
+                        wpm: 18, signal: 28, toneHz: 600, callsign: "N0CALL", routed: true),
         ]
         currentWPM = 23
+        // A provisional over mid-copy, so screenshots show the gray bubble.
+        // Copy in progress hides the off-tune hint by design; the monitor
+        // shot wants the hint, the chat shot wants the copy.
+        if ProcessInfo.processInfo.environment["DITS_OPEN"] != "monitor" {
+            pendingSegments = [CopySegment(id: -1, text: "UR 559 559 = NAME HANS", isFinal: false)]
+            refreshLiveText()
+        }
+        // A band with a strong station well off the tuned frequency, so
+        // the monitor's capture band and off-tune hint show in shots.
+        demoFrozen = true
+        spectrum = (0..<68).map { i -> Float in
+            let hz = 300.0 + Double(i) * 11.7
+            let peak = { (c: Double, w: Double, a: Double) in a * exp(-pow((hz - c) / w, 2)) }
+            return Float(min(1, 0.08 + peak(950, 18, 0.95) + peak(600, 22, 0.25) + Double(i % 5) * 0.01))
+        }
+        strongestPeakHz = 950
+        if settings.skimmerEnabled { skimChannelsHz = [950] }
+        incomingCall = IncomingCall(callsign: "K1ABC", conversationID: k1.id, at: now)
         state = .listening   // show a live-looking status without opening the mic
     }
     #endif
@@ -256,7 +369,12 @@ final class RadioController: ObservableObject {
         state = .stopped
         signalDetected = false
         inputLevel = 0
+        hearingKeying = false
+        strongestPeakHz = nil
+        peakStreak = 0
         commitSegment()
+        // Settle every revision now: nothing stays gray after Stop.
+        modem.flushPending()
         teardownSkimmer()
         spectrum = []
         applyScreenPolicy()
@@ -305,10 +423,11 @@ final class RadioController: ObservableObject {
     }
 
     private func pollMeters() {
-        guard state == .listening else { return }
+        guard state == .listening, !demoFrozen else { return }
         modem.pollStatus { [weak self] status in
             guard let self, self.state == .listening else { return }
             self.signalStrength = status.signal
+            if self.hearingKeying != status.hearingKeying { self.hearingKeying = status.hearingKeying }
             if self.signalDetected {
                 if status.wpm.isFinite, status.wpm > 0 { self.currentWPM = Int(status.wpm.rounded()) }
                 if status.toneHz.isFinite, status.toneHz > 0 { self.detectedToneHz = Int(status.toneHz.rounded()) }
@@ -361,17 +480,176 @@ final class RadioController: ObservableObject {
 
     // MARK: Receive pipeline
 
-    private func handleCharacter(_ character: Character, wpm: Double, signal: Float, tone: Double) {
-        // Characters still in flight on the DSP queue arrive after an
-        // explicit Stop; showing them makes Stop look broken.
-        guard state == .listening else { return }
-        if wpm.isFinite, wpm > 0 { currentWPM = Int(wpm.rounded()) }
-        signalStrength = signal
-        if tone.isFinite, tone > 0 { detectedToneHz = Int(tone.rounded()) }
+    private func handleTextEvent(_ event: CWTextEvent, wpm: Double, signal: Float, tone: Double) {
+        if case .character = event {
+            // Characters still in flight on the DSP queue arrive after an
+            // explicit Stop; showing them makes Stop look broken. Revisions
+            // and finalizations of copy already shown still apply.
+            guard state == .listening else { return }
+            if wpm.isFinite, wpm > 0 { currentWPM = Int(wpm.rounded()) }
+            signalStrength = signal
+            if tone.isFinite, tone > 0 { detectedToneHz = Int(tone.rounded()) }
+        }
+        applyTextEvent(event)
+    }
 
-        pendingSegment.append(character)
-        liveText = pendingSegment.trimmingCharacters(in: .whitespaces)
-        scheduleCommit()
+    /// Fold a decoder text event into the pending copy or, for a segment
+    /// already committed, into the message holding it. Internal so tests
+    /// can drive the provisional → final lifecycle without audio.
+    func applyTextEvent(_ event: CWTextEvent) {
+        switch event {
+        case .character(let character, let id):
+            if let i = pendingSegments.firstIndex(where: { $0.id == id }) {
+                pendingSegments[i].text.append(character)
+            } else if let messageID = segmentHomes[id] {
+                // The decoder had this segment open when we committed
+                // (the boundary mark raced a character): keep the copy
+                // with its message rather than starting a stray one.
+                updateProvisionalMessage(messageID) { segments in
+                    if let k = segments.firstIndex(where: { $0.id == id }) {
+                        segments[k].text.append(character)
+                    }
+                }
+                return
+            } else {
+                pendingSegments.append(CopySegment(id: id, text: String(character), isFinal: false))
+            }
+            refreshLiveText()
+            scheduleCommit()
+
+        case .revise(let id, let text):
+            if let i = pendingSegments.firstIndex(where: { $0.id == id }) {
+                pendingSegments[i].text = text
+                refreshLiveText()
+            } else if let messageID = segmentHomes[id] {
+                updateProvisionalMessage(messageID) { segments in
+                    if let k = segments.firstIndex(where: { $0.id == id }) { segments[k].text = text }
+                }
+            }
+
+        case .finalize(let id):
+            if let i = pendingSegments.firstIndex(where: { $0.id == id }) {
+                pendingSegments[i].isFinal = true
+            } else if let messageID = segmentHomes[id] {
+                updateProvisionalMessage(messageID) { segments in
+                    if let k = segments.firstIndex(where: { $0.id == id }) { segments[k].isFinal = true }
+                }
+            }
+        }
+    }
+
+    private func refreshLiveText() {
+        liveText = RadioController.joinedText(pendingSegments)
+        liveDestinationID = liveText.isEmpty ? nil : liveDestination(for: liveText)
+    }
+
+    /// Segments are separated by a burst gap — a word gap at least.
+    nonisolated static func joinedText(_ segments: [CopySegment]) -> String {
+        segments.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    /// Offset into the joined text where copy the decoder may still
+    /// revise begins; nil when every segment is final.
+    nonisolated static func provisionalOffset(_ segments: [CopySegment]) -> Int? {
+        let trimmed = segments.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+        var offset = 0
+        for (segment, text) in zip(segments, trimmed) where !text.isEmpty {
+            if !segment.isFinal { return offset }
+            offset += text.count + 1
+        }
+        return nil
+    }
+
+    /// Re-render a committed message from its segments after a revision
+    /// or finalization: text and callsign in every thread holding it, and
+    /// its monitor entry. Fully final messages leave the revisable set.
+    private func updateProvisionalMessage(_ messageID: UUID, _ mutate: (inout [CopySegment]) -> Void) {
+        guard var provisional = provisionalMessages[messageID] else { return }
+        mutate(&provisional.segments)
+        let text = RadioController.joinedText(provisional.segments)
+        let offset = RadioController.provisionalOffset(provisional.segments)
+        let call = CallsignParser.counterparty(in: text, myCall: settings.callsign)
+
+        for conversationID in provisional.conversationIDs {
+            guard let ci = conversations.firstIndex(where: { $0.id == conversationID }),
+                  let mi = conversations[ci].messages.firstIndex(where: { $0.id == messageID }) else { continue }
+            conversations[ci].messages[mi].text = text
+            conversations[ci].messages[mi].provisionalFrom = offset
+            // Only a callsign the copy actually carries can replace one:
+            // a revision that garbles the "DE" mustn't blank the thread's
+            // attribution.
+            if let call { conversations[ci].messages[mi].callsign = call }
+        }
+        if let entryID = provisional.monitorEntryID,
+           let ei = monitor.firstIndex(where: { $0.id == entryID }) {
+            monitor[ei].text = text
+            monitor[ei].isProvisional = offset != nil
+            if let call { monitor[ei].callsign = call }
+        }
+
+        if offset == nil {
+            provisionalMessages.removeValue(forKey: messageID)
+            for segment in provisional.segments { segmentHomes.removeValue(forKey: segment.id) }
+        } else {
+            provisionalMessages[messageID] = provisional
+        }
+        persistConversations()
+    }
+
+    /// A message the decoder never finalized (its channel was rebuilt,
+    /// or the app stopped mid-copy) must not stay gray forever.
+    private func expireProvisionalMessages() {
+        let cutoff = Date().addingTimeInterval(-60)
+        for (messageID, provisional) in provisionalMessages where provisional.committedAt < cutoff {
+            updateProvisionalMessage(messageID) { segments in
+                for k in segments.indices { segments[k].isFinal = true }
+            }
+        }
+    }
+
+    /// Where primary-channel copy would be routed if it committed now.
+    /// Mirrors `commitCopy`'s policy so the provisional bubble appears in
+    /// the same thread the final message will. Internal for tests.
+    func liveDestination(for text: String) -> UUID? {
+        if let visible = visibleConversationID, conversation(id: visible) != nil {
+            return visible
+        }
+        if let call = CallsignParser.counterparty(in: text, myCall: settings.callsign) {
+            return newestConversation(with: call)?.id ?? cqEchoDestination(hasCallsign: true, text: text)
+        }
+        if let active = activeConversationID,
+           Date().timeIntervalSince(lastQSOActivity) < qsoReplyWindow,
+           isSubstantialCopy(text),
+           conversation(id: active) != nil {
+            return active
+        }
+        return cqEchoDestination(hasCallsign: false, text: text)
+    }
+
+    /// The operator opened (or left) a thread. Opening one is as clear a
+    /// statement of intent as keying in it: it becomes the active thread,
+    /// and while it stays on screen it receives everything copied on the
+    /// primary channel. Leaving restores the normal routing rules, with
+    /// the thread still active inside the QSO window.
+    func setVisibleConversation(_ id: UUID?) {
+        if let id {
+            guard conversation(id: id) != nil else { return }
+            visibleConversationID = id
+            activate(id)
+            if incomingCall?.conversationID == id { incomingCall = nil }
+        } else {
+            visibleConversationID = nil
+        }
+        if !liveText.isEmpty { liveDestinationID = liveDestination(for: liveText) }
+    }
+
+    /// The operator navigated away from `id`. Guarded so a push/pop pair's
+    /// appear/disappear ordering can't clear a thread that just appeared.
+    func clearVisibleConversation(_ id: UUID) {
+        guard visibleConversationID == id else { return }
+        setVisibleConversation(nil)
     }
 
     private func scheduleCommit() {
@@ -382,82 +660,155 @@ final class RadioController: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func commitSegment() {
+    /// The copy so far becomes a message. Internal for tests.
+    func commitSegment() {
         commitWork?.cancel()
         commitWork = nil
-        let text = pendingSegment.trimmingCharacters(in: .whitespacesAndNewlines)
-        pendingSegment = ""
+        let segments = pendingSegments
+            .map { CopySegment(id: $0.id, text: $0.text.trimmingCharacters(in: .whitespacesAndNewlines), isFinal: $0.isFinal) }
+            .filter { !$0.text.isEmpty }
+        pendingSegments = []
         liveText = ""
-        commitCopy(text,
+        liveDestinationID = nil
+        // No later revision may straddle this message's end.
+        modem.markBoundary()
+        expireProvisionalMessages()
+        commitCopy(RadioController.joinedText(segments),
                    wpm: max(currentWPM, 1),
                    signal: Int((signalStrength * 100).rounded()),
-                   toneHz: detectedToneHz)
+                   toneHz: detectedToneHz,
+                   segments: segments)
     }
+
+    /// Which decoder produced a chunk of copy. Only the primary channel is
+    /// what the operator is tuned to; skimmer copy is off-frequency and
+    /// never lands in the thread they're looking at.
+    enum CopyChannel { case primary, skimmer }
 
     /// Shared commit path for the primary channel and skimmer channels:
     /// monitor entry, callsign routing, persistence. Internal rather than
     /// private so tests can exercise routing without an audio path.
-    func commitCopy(_ text: String, wpm: Int, signal: Int, toneHz: Int) {
-        guard text.count >= 2 else { return }
+    func commitCopy(_ text: String, wpm: Int, signal: Int, toneHz: Int,
+                    channel: CopyChannel = .primary, segments: [CopySegment] = []) {
+        // The thread on screen takes everything on the primary channel —
+        // even a lone "R" or "K", which is a whole over in CW. The raw
+        // monitor shows everything too: a lone character is flagged as
+        // probable noise rather than silently dropped, so the operator
+        // can see what's being heard and thrown away.
+        let visible: UUID? = {
+            guard channel == .primary, let id = visibleConversationID,
+                  conversation(id: id) != nil else { return nil }
+            return id
+        }()
+        let chars = text.filter { !$0.isWhitespace }
+        guard !chars.isEmpty else { return }
+        let isNoise = chars.count < 2
 
         let call = CallsignParser.counterparty(in: text, myCall: settings.callsign)
+        let provisionalFrom = RadioController.provisionalOffset(segments)
         let entry = DecodeEntry(
             text: text,
             wpm: wpm,
             signal: signal,
             toneHz: toneHz,
-            callsign: call
+            callsign: call,
+            isProvisional: provisionalFrom != nil,
+            isSkimmed: channel == .skimmer,
+            isNoise: isNoise
         )
         monitor.append(entry)
         if monitor.count > maxMonitorEntries {
             monitor.removeFirst(monitor.count - maxMonitorEntries)
         }
 
+        // Every thread's copy shares one message id, so a revision can
+        // find all of them.
+        let messageID = UUID()
+        var homes: [UUID] = []
         func received(callsign: String?) -> Message {
             Message(
+                id: messageID,
                 text: text,
                 direction: .received,
                 status: .received,
                 callsign: callsign,
                 wpm: entry.wpm,
                 toneHz: entry.toneHz,
-                signal: entry.signal
+                signal: entry.signal,
+                provisionalFrom: provisionalFrom
             )
+        }
+        defer {
+            if let ei = monitor.firstIndex(where: { $0.id == entry.id }) {
+                monitor[ei].routed = !homes.isEmpty
+            }
+            if provisionalFrom != nil {
+                provisionalMessages[messageID] = ProvisionalMessage(
+                    segments: segments,
+                    conversationIDs: homes,
+                    monitorEntryID: entry.id,
+                    committedAt: Date())
+                for segment in segments { segmentHomes[segment.id] = messageID }
+            }
         }
 
         // Answers to a CQ also land in the thread that called it: the
         // operator is sitting there waiting, and a reply whose callsign
         // didn't parse would otherwise vanish into the monitor. Only the
         // thread the call went out from — an older CQ never collects copy.
-        let cqEcho: UUID? = {
-            guard let cq = cqConversationID,
-                  Date().timeIntervalSince(lastCQActivity) < cqReplyWindow,
-                  call != nil || isSubstantialCopy(text),
-                  conversation(id: cq) != nil else { return nil }
-            return cq
-        }()
+        let cqEcho = isNoise ? nil : cqEchoDestination(hasCallsign: call != nil, text: text)
+
+        // Where the operator is looking always shows what was heard —
+        // first, so it's never a duplicate of a routing below.
+        var delivered: Set<UUID> = []
+        if let visible {
+            appendMessage(received(callsign: call), to: visible)
+            delivered.insert(visible)
+            homes.append(visible)
+        }
 
         if let call {
             // A station identified itself: its newest thread owns this copy,
             // and becomes the one subsequent unaddressed overs route into.
             // Copy arriving in a thread the operator hasn't opened is unread.
             let id = conversationID(with: call, lastReadAt: .distantPast)
-            appendMessage(received(callsign: call), to: id)
-            if let cq = cqEcho, cq != id {
+            if delivered.insert(id).inserted {
+                appendMessage(received(callsign: call), to: id)
+                homes.append(id)
+            }
+            if channel == .primary { noteIncomingCall(call, text: text, conversationID: id) }
+            if let cq = cqEcho, delivered.insert(cq).inserted {
                 appendMessage(received(callsign: call), to: cq)
+                homes.append(cq)
             }
             activate(id)
+        } else if visible != nil {
+            // Already on screen; the QSO is evidently still going.
+            lastQSOActivity = Date()
         } else if let active = activeConversationID,
                   Date().timeIntervalSince(lastQSOActivity) < qsoReplyWindow,
                   isSubstantialCopy(text),
                   conversation(id: active) != nil {
             // Mid-QSO overs drop the "DE <call>" after the first exchange.
             appendMessage(received(callsign: nil), to: active)
+            homes.append(active)
             lastQSOActivity = Date()
         } else if let cq = cqEcho {
             appendMessage(received(callsign: nil), to: cq)
+            homes.append(cq)
         }
         persistConversations()
+    }
+
+    /// The CQ thread that should echo this copy, if its answer window is
+    /// open: any identified station, or unparsed copy substantial enough
+    /// to be an answer rather than noise.
+    private func cqEchoDestination(hasCallsign: Bool, text: String) -> UUID? {
+        guard let cq = cqConversationID,
+              Date().timeIntervalSince(lastCQActivity) < cqReplyWindow,
+              hasCallsign || isSubstantialCopy(text),
+              conversation(id: cq) != nil else { return nil }
+        return cq
     }
 
     /// Copy worth routing into a thread without a parsed callsign: long
@@ -470,6 +821,45 @@ final class RadioController: ObservableObject {
         guard chars.count >= 4 else { return false }
         let junk = chars.filter { "EISH5T".contains($0) }.count
         return Double(junk) < Double(chars.count) * 0.7
+    }
+
+    /// Demo mode only: keep the seeded spectrum and meters instead of
+    /// whatever the simulator's microphone hears.
+    private var demoFrozen = false
+
+    // MARK: Strongest peak
+
+    private var peakCandidateHz = 0
+    private var peakStreak = 0
+
+    /// Peak-pick every frame, but only publish a peak that holds still
+    /// for ~0.4 s: keyed CW comes and goes at element rate and the hint
+    /// built on this must not flicker.
+    private func trackStrongestPeak(_ frame: SpectrumAnalyzer.Frame) {
+        let power = frame.power
+        guard power.count > 8 else { return }
+        let median = Double(power.sorted()[power.count / 2])
+        var bestBin = -1
+        var bestPower: Float = 0
+        for (i, p) in power.enumerated() where Double(p) > max(median, 1e-12) * 12 && p > bestPower {
+            bestBin = i
+            bestPower = p
+        }
+        guard bestBin >= 0 else {
+            peakStreak = max(0, peakStreak - 1)
+            if peakStreak == 0, strongestPeakHz != nil { strongestPeakHz = nil }
+            return
+        }
+        let hz = Int((frame.frequency(ofBin: bestBin) / 10).rounded() * 10)
+        if abs(hz - peakCandidateHz) <= 30 {
+            peakStreak = min(peakStreak + 1, 12)
+        } else {
+            peakCandidateHz = hz
+            peakStreak = 1
+        }
+        if peakStreak >= 5, strongestPeakHz != peakCandidateHz {
+            strongestPeakHz = peakCandidateHz
+        }
     }
 
     // MARK: Skimmer (secondary decode channels feeding the Band Monitor)
@@ -518,6 +908,8 @@ final class RadioController: ObservableObject {
             skimChannels[hz] = SkimChannel()
         }
         modem.setSkimChannels(keep.map(Double.init), settings: settings)
+        let sorted = keep.sorted()
+        if sorted != skimChannelsHz { skimChannelsHz = sorted }
     }
 
     /// Local maxima well above the band's median power, excluding the
@@ -568,13 +960,15 @@ final class RadioController: ObservableObject {
         commitCopy(text,
                    wpm: max(channel.wpm, 1),
                    signal: Int((channel.signal * 100).rounded()),
-                   toneHz: hz)
+                   toneHz: hz,
+                   channel: .skimmer)
     }
 
     private func teardownSkimmer() {
         for hz in skimChannels.keys { commitSkimChannel(hz) }
         skimChannels.removeAll()
         modem.setSkimChannels([], settings: settings)
+        if !skimChannelsHz.isEmpty { skimChannelsHz = [] }
     }
 
     // MARK: Transmit
@@ -842,6 +1236,8 @@ final class RadioController: ObservableObject {
         conversations.removeAll { $0.id == id }
         if activeConversationID == id { activeConversationID = nil }
         if cqConversationID == id { cqConversationID = nil }
+        if visibleConversationID == id { visibleConversationID = nil }
+        if liveDestinationID == id { liveDestinationID = liveDestination(for: liveText) }
         persistConversations()
     }
 
@@ -866,6 +1262,8 @@ final class RadioController: ObservableObject {
             c.messages = c.messages.map { message in
                 var m = message
                 if m.status == .queued || m.status == .sending { m.status = .failed }
+                // A decoder that isn't running any more can't revise it.
+                m.provisionalFrom = nil
                 return m
             }
             return c

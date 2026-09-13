@@ -40,6 +40,12 @@ struct Message: Identifiable, Equatable, Codable {
     /// Relative signal strength at decode time, 0–100. RX only.
     var signal: Int?
 
+    /// Offset into `text` from which the copy is still provisional — the
+    /// decoder may revise it from its retained keying timeline until it
+    /// finalizes. nil once the whole message is final. RX only; never
+    /// survives a relaunch (see RadioController.sanitized).
+    var provisionalFrom: Int?
+
     init(
         id: UUID = UUID(),
         text: String,
@@ -49,7 +55,8 @@ struct Message: Identifiable, Equatable, Codable {
         callsign: String? = nil,
         wpm: Int? = nil,
         toneHz: Int? = nil,
-        signal: Int? = nil
+        signal: Int? = nil,
+        provisionalFrom: Int? = nil
     ) {
         self.id = id
         self.text = text
@@ -60,5 +67,6 @@ struct Message: Identifiable, Equatable, Codable {
         self.wpm = wpm
         self.toneHz = toneHz
         self.signal = signal
+        self.provisionalFrom = provisionalFrom
     }
 }

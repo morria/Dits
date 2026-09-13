@@ -130,7 +130,7 @@ struct SettingsView: View {
         } header: {
             Text("Transmit")
         } footer: {
-            Text("Set the transmit level so your radio shows little or no ALC. Keying uses VOX or your CAT/PTT interface.")
+            Text("Tone is also the frequency the decoder listens on (±\(RadioController.captureHalfWidthHz) Hz) — tap a peak in the Band Monitor's spectrum to retune. Set the transmit level so your radio shows little or no ALC. Keying uses VOX or your CAT/PTT interface.")
         }
     }
 
@@ -228,7 +228,7 @@ struct SettingsView: View {
         } header: {
             Text("Receive")
         } footer: {
-            Text("The skimmer also decodes the two strongest off-channel signals into the Band Monitor. Advanced: \(radio.settings.decoder.detail) Narrow the speed range if noise keeps decoding as very fast or very slow characters.")
+            Text("The skimmer also decodes the two strongest signals outside the tuned range into the Band Monitor, marked in orange on the spectrum. Advanced: \(radio.settings.decoder.detail) Narrow the speed range if noise keeps decoding as very fast or very slow characters.")
         }
     }
 

@@ -114,7 +114,14 @@ private struct MonitorRow: View {
 }
 
 private struct ConversationRow: View {
+    @EnvironmentObject private var radio: RadioController
     let conversation: Conversation
+
+    /// Copy being decoded right now that will land in this thread.
+    private var liveCopy: String? {
+        guard radio.liveDestinationID == conversation.id, !radio.liveText.isEmpty else { return nil }
+        return radio.liveText
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -125,8 +132,14 @@ private struct ConversationRow: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(conversation.counterparty)
-                        .font(.headline)
+                    if conversation.isCQ {
+                        Label("Calling CQ", systemImage: "megaphone.fill")
+                            .font(.headline)
+                            .labelStyle(.titleAndIcon)
+                    } else {
+                        Text(conversation.counterparty)
+                            .font(.headline)
+                    }
                     Spacer()
                     // Several CQ threads can share a title — the time is what
                     // tells them apart, so an empty one dates from its start.
@@ -136,10 +149,26 @@ private struct ConversationRow: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                Text(preview)
-                    .font(.subheadline.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2, reservesSpace: true)
+                if let liveCopy {
+                    // Provisional copy reads gray-on-gray, same convention
+                    // as the bubble it will become inside the thread.
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                            .font(.caption2)
+                            .foregroundStyle(.green)
+                            .symbolEffect(.variableColor.iterative, options: .repeating)
+                        Text(liveCopy + " ▌")
+                            .font(.subheadline.monospaced())
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(2, reservesSpace: true)
+                            .truncationMode(.head)
+                    }
+                } else {
+                    Text(preview)
+                        .font(.subheadline.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2, reservesSpace: true)
+                }
             }
         }
         .contentShape(Rectangle())

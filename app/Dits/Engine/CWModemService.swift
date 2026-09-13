@@ -19,83 +19,82 @@ protocol CWReceiving: AnyObject {
     /// Reduce DSP cost while the app is backgrounded (no-op for the
     /// single decoders; the diversity decoder drops to its classic leg).
     func setLowPower(_ enabled: Bool)
+    /// The app committed the copy so far as a message: no later revision
+    /// may straddle this point.
+    func markBoundary()
+    /// Release held copy and settle every revision (listening stopped).
+    func flushPending()
     var estimatedWPM: Double { get }
     var signalStrength: Float { get }
     var toneFrequency: Double { get }
+    /// Speed and tone fitted to the whole recent window by the revising
+    /// layer, when it has one — steadier than the streaming estimates.
+    var fittedWPM: Double? { get }
+    var fittedToneFrequency: Double? { get }
+    /// Keying the gate accepted since the last character came out, and
+    /// how long ago the last element ended — "hearing something" that
+    /// isn't (yet) copy.
+    var unclaimedKeying: (elements: Int, ageSeconds: Double) { get }
+    /// Streaming characters (skimmer channels use this).
     var onCharacter: ((Character) -> Void)? { get set }
+    /// Provisional/revised/finalized text (the primary channel uses this).
+    var onTextEvent: ((CWTextEvent) -> Void)? { get set }
     var onSignal: ((Bool) -> Void)? { get set }
 }
 
-/// Classic Goertzel state-machine decoder (`CWDemodulator`).
-private final class ClassicReceiver: CWReceiving, CWDemodulatorDelegate {
-    private let demod: CWDemodulator
+/// Any Core streaming decoder (classic, Bayesian, or diversity) behind
+/// the revising layer: characters stream out provisionally and are
+/// revised from the retained keying timeline (`RevisingCWDecoder`).
+private final class RevisingReceiver: CWReceiving {
+    private let revising: RevisingCWDecoder
+    private let dual: DualCWDecoder?
     var onCharacter: ((Character) -> Void)?
+    var onTextEvent: ((CWTextEvent) -> Void)?
     var onSignal: ((Bool) -> Void)?
 
-    init(config: CWConfiguration, minWPM: Double, maxWPM: Double) {
-        demod = CWDemodulator(configuration: config)
-        demod.minWPM = minWPM
-        demod.maxWPM = maxWPM
-        demod.delegate = self
+    init(base: CWStreamingDecoder, dual: DualCWDecoder?, sampleRate: Double) {
+        self.dual = dual
+        revising = RevisingCWDecoder(base: base, sampleRate: sampleRate)
+        revising.onTextEvent = { [weak self] event in
+            self?.onTextEvent?(event)
+            if case .character(let c, _) = event { self?.onCharacter?(c) }
+        }
+        revising.onSignalDetected = { [weak self] detected, _ in self?.onSignal?(detected) }
     }
 
-    func process(_ samples: [Float]) { demod.process(samples: samples) }
-    func resynchronize() { demod.resynchronize() }
-    func setLowPower(_ enabled: Bool) {}
-    var estimatedWPM: Double { demod.estimatedWPM }
-    var signalStrength: Float { demod.signalStrength }
-    var toneFrequency: Double { demod.toneFrequency }
-
-    func demodulator(_ demodulator: CWDemodulator, didDecode character: Character, atFrequency frequency: Double) {
-        onCharacter?(character)
-    }
-    func demodulator(_ demodulator: CWDemodulator, signalDetected detected: Bool, atFrequency frequency: Double) {
-        onSignal?(detected)
-    }
-}
-
-/// Probabilistic beam-search decoder (`BayesianCWDecoder`).
-private final class BayesianReceiver: CWReceiving {
-    private let dec: BayesianCWDecoder
-    var onCharacter: ((Character) -> Void)?
-    var onSignal: ((Bool) -> Void)?
-
-    init(config: CWConfiguration, minWPM: Double, maxWPM: Double) {
-        dec = BayesianCWDecoder(configuration: config)
-        dec.minWPM = minWPM
-        dec.maxWPM = maxWPM
-        dec.onCharacterDecoded = { [weak self] character, _ in self?.onCharacter?(character) }
-        dec.onSignalDetected = { [weak self] detected, _ in self?.onSignal?(detected) }
+    static func make(_ decoder: CWDecoder, config: CWConfiguration,
+                     minWPM: Double, maxWPM: Double) -> RevisingReceiver {
+        switch decoder {
+        case .classic:
+            let d = CWDemodulator(configuration: config)
+            d.minWPM = minWPM; d.maxWPM = maxWPM
+            return RevisingReceiver(base: d, dual: nil, sampleRate: config.sampleRate)
+        case .bayesian:
+            let d = BayesianCWDecoder(configuration: config)
+            d.minWPM = minWPM; d.maxWPM = maxWPM
+            return RevisingReceiver(base: d, dual: nil, sampleRate: config.sampleRate)
+        case .diversity:
+            let d = DualCWDecoder(configuration: config)
+            d.minWPM = minWPM; d.maxWPM = maxWPM
+            return RevisingReceiver(base: d, dual: d, sampleRate: config.sampleRate)
+        }
     }
 
-    func process(_ samples: [Float]) { dec.process(samples: samples) }
-    func resynchronize() { dec.resynchronize() }
-    func setLowPower(_ enabled: Bool) {}
-    var estimatedWPM: Double { dec.estimatedWPM }
-    var signalStrength: Float { dec.signalStrength }
-    var toneFrequency: Double { dec.toneFrequency }
-}
-
-/// Diversity decoder that fuses both of the above (`DualCWDecoder`).
-private final class DiversityReceiver: CWReceiving {
-    private let dec: DualCWDecoder
-    var onCharacter: ((Character) -> Void)?
-    var onSignal: ((Bool) -> Void)?
-
-    init(config: CWConfiguration, minWPM: Double, maxWPM: Double) {
-        dec = DualCWDecoder(configuration: config)
-        dec.minWPM = minWPM
-        dec.maxWPM = maxWPM
-        dec.onCharacterDecoded = { [weak self] character, _ in self?.onCharacter?(character) }
-        dec.onSignalDetected = { [weak self] detected, _ in self?.onSignal?(detected) }
+    func process(_ samples: [Float]) { revising.process(samples: samples) }
+    func resynchronize() { revising.resynchronize() }
+    func setLowPower(_ enabled: Bool) { dual?.lowPowerMode = enabled }
+    func markBoundary() { revising.markBoundary() }
+    func flushPending() { revising.flushPending() }
+    var estimatedWPM: Double { revising.estimatedWPM }
+    var signalStrength: Float { revising.signalStrength }
+    var toneFrequency: Double { revising.toneFrequency }
+    var fittedWPM: Double? { revising.fittedWPM }
+    var fittedToneFrequency: Double? { revising.fittedFrequency }
+    var unclaimedKeying: (elements: Int, ageSeconds: Double) {
+        guard let last = revising.lastElementSample else { return (0, .infinity) }
+        let age = Double(revising.base.sampleClock - last) / CWModemService.sampleRate
+        return (revising.elementsSinceLastCharacter, age)
     }
-
-    func process(_ samples: [Float]) { dec.process(samples: samples) }
-    func resynchronize() { dec.resynchronize() }
-    func setLowPower(_ enabled: Bool) { dec.lowPowerMode = enabled }
-    var estimatedWPM: Double { dec.estimatedWPM }
-    var signalStrength: Float { dec.signalStrength }
-    var toneFrequency: Double { dec.toneFrequency }
 }
 
 // MARK: - Service
@@ -114,6 +113,10 @@ final class CWModemService {
 
     /// char, decoded WPM, signal strength (0–1), tone Hz. Fired on main.
     var onCharacter: ((Character, Double, Float, Double) -> Void)?
+    /// Primary-channel text events (provisional characters, revisions,
+    /// finalizations) with the decoder's WPM/signal/tone at the time.
+    /// Fired on main, in order.
+    var onTextEvent: ((CWTextEvent, Double, Float, Double) -> Void)?
     /// Signal detected/lost. Fired on main.
     var onSignal: ((Bool) -> Void)?
     /// Skimmer copy: char, channel Hz, decoded WPM, signal. Fired on main.
@@ -128,12 +131,12 @@ final class CWModemService {
         // Capture the receiver weakly (not through self.receiver): after a
         // settings rebuild swaps the receiver, a late character from the old
         // decoder must report the old decoder's WPM/tone, not the new one's.
-        receiver.onCharacter = { [weak self, weak receiver] character in
+        receiver.onTextEvent = { [weak self, weak receiver] event in
             guard let self, let receiver else { return }
-            let wpm = receiver.estimatedWPM
+            let wpm = receiver.fittedWPM ?? receiver.estimatedWPM
             let signal = receiver.signalStrength
-            let tone = receiver.toneFrequency
-            DispatchQueue.main.async { self.onCharacter?(character, wpm, signal, tone) }
+            let tone = receiver.fittedToneFrequency ?? receiver.toneFrequency
+            DispatchQueue.main.async { self.onTextEvent?(event, wpm, signal, tone) }
         }
         receiver.onSignal = { [weak self] detected in
             DispatchQueue.main.async { self?.onSignal?(detected) }
@@ -147,14 +150,19 @@ final class CWModemService {
         let wpm: Double
         let signal: Float
         let toneHz: Double
+        /// Keying heard in the last couple of seconds that produced no
+        /// copy: held by emission probation or dropped as junk.
+        let hearingKeying: Bool
     }
 
     func pollStatus(_ completion: @escaping (ReceiverStatus) -> Void) {
         queue.async {
+            let keying = self.receiver.unclaimedKeying
             let status = ReceiverStatus(
-                wpm: self.receiver.estimatedWPM,
+                wpm: self.receiver.fittedWPM ?? self.receiver.estimatedWPM,
                 signal: self.receiver.signalStrength,
-                toneHz: self.receiver.toneFrequency
+                toneHz: self.receiver.fittedToneFrequency ?? self.receiver.toneFrequency,
+                hearingKeying: keying.elements >= 3 && keying.ageSeconds < 2.0
             )
             DispatchQueue.main.async { completion(status) }
         }
@@ -166,13 +174,18 @@ final class CWModemService {
             wpm: Double(settings.wpm),
             sampleRate: sampleRate
         )
-        let minW = Double(settings.minWPM)
-        let maxW = Double(settings.maxWPM)
-        switch settings.decoder {
-        case .classic:   return ClassicReceiver(config: config, minWPM: minW, maxWPM: maxW)
-        case .bayesian:  return BayesianReceiver(config: config, minWPM: minW, maxWPM: maxW)
-        case .diversity: return DiversityReceiver(config: config, minWPM: minW, maxWPM: maxW)
-        }
+        return RevisingReceiver.make(settings.decoder, config: config,
+                                     minWPM: Double(settings.minWPM), maxWPM: Double(settings.maxWPM))
+    }
+
+    /// The app committed the copy so far as a message.
+    func markBoundary() {
+        queue.async { self.receiver.markBoundary() }
+    }
+
+    /// Listening stopped: settle every provisional segment now.
+    func flushPending() {
+        queue.async { self.receiver.flushPending() }
     }
 
     private var pendingRebuild: DispatchWorkItem?
@@ -185,6 +198,9 @@ final class CWModemService {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.queue.async {
+                // Copy shown from the old decoder can't be revised by the
+                // new one — settle it so nothing stays gray forever.
+                self.receiver.flushPending()
                 let receiver = CWModemService.makeReceiver(settings: settings)
                 self.wire(receiver)
                 self.receiver = receiver
@@ -247,6 +263,8 @@ final class CWModemService {
                 channelSettings.toneHz = Int(hz)
                 channelSettings.decoder = .classic
                 let skim = CWModemService.makeReceiver(settings: channelSettings)
+                // Skimmer copy only feeds the monitor; ignore its revisions.
+                skim.onTextEvent = nil
                 skim.onCharacter = { [weak self, weak skim] character in
                     guard let self, let skim else { return }
                     let wpm = skim.estimatedWPM

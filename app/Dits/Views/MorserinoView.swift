@@ -138,7 +138,9 @@ struct MorserinoView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(device.name)
                                     .foregroundStyle(.primary)
-                                Text("Signal \(device.rssi) dBm")
+                                Text(device.isMorserino
+                                     ? "Signal \(device.rssi) dBm"
+                                     : "Signal \(device.rssi) dBm · not a Morserino")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -151,10 +153,17 @@ struct MorserinoView: View {
                     .disabled(keyer.connectionState == .connecting)
                 }
             }
+            if keyer.hasRememberedDevice {
+                Button(role: .destructive) {
+                    keyer.forgetDevice()
+                } label: {
+                    Label("Forget Remembered Device", systemImage: "trash")
+                }
+            }
         } header: {
             Text("Devices")
         } footer: {
-            Text("Requires a Morserino-32 with BLE serial firmware.")
+            Text("Requires a Morserino-32 with BLE serial firmware. Dits connects on its own only to a device that advertises as a Morserino; anything else needs a tap here.")
         }
     }
 }
